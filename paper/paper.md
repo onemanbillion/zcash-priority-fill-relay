@@ -53,7 +53,7 @@ The rule adapts to whichever side is the bottleneck. A home node whose upload is
 
 In Figure 1, fair sharing gets no relayer the block until time 4.0. Strict one-at-a-time gets relayer A going at 1.7 but wastes upload on slower receivers. Priority fill gets A, B and C going at 1.7, 2.2 and 3.0 with no upload wasted while relayers wait. The slow leaf D, which relays to no one, is served last in exchange.
 
-A second, optional change was also tested: announcing relayed blocks to every peer instead of a random third. It made no measurable difference (section 6), so the proposal is the scheduler alone.
+A second, optional change was also tested: announcing relayed blocks to every peer instead of a random third. It made no measurable difference for freshly started nodes (section 6), so the proposal is the scheduler alone. The testbed's steady-state proposal runs did announce to every peer; the 1,000-node model keeps one-third announcements and still shows most of the gain.
 
 ## 4. Why it should work
 
@@ -90,7 +90,7 @@ The idea was tested in two stages: discrete-event simulations to explore it, the
 
 Each node's rates vary about ±35% around its type. Each node opens Zebra's default 25 outbound connections, so hosted nodes have about 65 peers and home nodes about 25. A second network makes every node a datacenter node, closer to ZIP 218's devnet. A third adds ten slow-reading attackers, described in section 8.
 
-**Runs.** 100 nodes per run; a random datacenter node mines a block every 25 s, all miners with equal hashrate. Each run mines 8 blocks and discards the first 2. Three mixed topologies were each run with current Zebra behaviour and with the proposal. All runs used 4× time dilation (bandwidths divided by 4, every delay multiplied by 4) so that 100 nodes fit on one 2-core machine; event-loop lag stayed under 26 ms of real time at the 99th percentile.
+**Runs.** 100 nodes per run; a random datacenter node mines a block every 25 s, all miners with equal hashrate. Each run mines 8 blocks and discards the first 2. Three mixed topologies were each run with current Zebra behaviour and with the proposal. In the testbed, proposal runs also announced relayed blocks to every peer rather than Zebra's random third, except one comparison run with freshly started nodes; steady state with one-third announcements was not tested. The 1,000-node model keeps Zebra's one-third announcements in both modes. All runs used 4× time dilation (bandwidths divided by 4, every delay multiplied by 4) so that 100 nodes fit on one 2-core machine; event-loop lag stayed under 26 ms of real time at the 99th percentile.
 
 **Poisson block arrivals.** Real blocks arrive as a Poisson process: intervals are exponential with a 25 s mean, so about 11% of blocks come within 3 s of the previous one and about 24% within 7 s. The testbed runs mined on a fixed 25 s schedule. Every model run in section 6.1 mines on a Poisson schedule with the same mean, the same schedule for both modes. Testbed runs with Poisson block arrivals were attempted but could not be used: when blocks arrived seconds apart, 100 nodes on one 8 GB machine ran out of memory and stalled for tens of seconds.
 

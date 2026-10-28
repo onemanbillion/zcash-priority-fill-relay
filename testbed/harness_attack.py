@@ -8,7 +8,7 @@ they read in real seconds. It keeps the machine's CPU from becoming the bottlene
 """
 import argparse, json, math, os, random, signal, subprocess, sys, time
 
-BIN = "/home/claude/zebra/zebra-relay/target/release/zebra-relay"
+BIN = os.environ.get("ZEBRA_RELAY_BIN", "zebra-relay")  # path to the built zebra-relay binary
 CLASSES = [("datacenter", .30, 500, 500), ("fiber", .25, 100, 500),
            ("cable", .35, 15, 150), ("poor", .10, 3, 25)]
 REACH = {"datacenter": 1.0, "fiber": .5, "cable": .2, "poor": .05}

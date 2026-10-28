@@ -9,6 +9,8 @@ In a 100-node testbed built on Zebra's own networking code, with 2 MB blocks eve
 
 **Read the paper:** [`paper/paper.pdf`](paper/paper.pdf) (source: [`paper/paper.md`](paper/paper.md))
 
+**Discussion:** [Zcash Community Forum thread](https://forum.zcashcommunity.com/t/priority-fill-block-relay-fewer-orphans-under-25-s-blocks-no-fork-needed-zecathon-submission/58563) · **Live simulation:** https://web-production-b8358a.up.railway.app
+
 ## Contents
 
 | Path | What it is |

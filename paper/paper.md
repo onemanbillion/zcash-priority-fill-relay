@@ -1,6 +1,6 @@
 ---
 title: "Priority-Fill Block Relay for Zcash: A Discussion Paper"
-author: "Paul"
+author: "Paul Church"
 date: "October 28, 2026"
 ---
 

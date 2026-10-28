@@ -1,0 +1,66 @@
+From 8adf60516ec18a02f35dbec30220ff3a35771ef4 Mon Sep 17 00:00:00 2001
+From: testbed <hello@paul.church>
+Date: Wed, 28 Oct 2026 13:29:05 -0500
+Subject: [PATCH 3/3] fix(network): set testbed fairness bounds above normal
+ queue times
+
+A 500 ms fairness bound and 2 s gate cap reordered or force-admitted normal
+transfers (queues drain within about 4 s per block), raising the estimated
+stale rate from 3.1% to 5.1%. Use 5 s and 10 s: starvation stays bounded and
+normal priority order is unchanged.
+---
+ zebra-network/src/testbed.rs       | 10 +++++++---
+ zebra-network/src/testbed/tests.rs |  6 +++---
+ 2 files changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/zebra-network/src/testbed.rs b/zebra-network/src/testbed.rs
+index b441eb5..d213c28 100644
+--- a/zebra-network/src/testbed.rs
++++ b/zebra-network/src/testbed.rs
+@@ -58,9 +58,13 @@ const RAMP: Duration = Duration::from_millis(50);
+ /// Window used to measure upload utilization.
+ const UTIL_WINDOW: Duration = Duration::from_millis(100);
+ /// A request waiting longer than this is served before any higher-ranked request.
+-const MAX_FAIR_WAIT: Duration = Duration::from_millis(500);
+-/// A request waiting longer than this is served without waiting for a free slot.
+-const MAX_GATE_WAIT: Duration = Duration::from_secs(2);
++///
++/// Normal queues drain within about 4 s of a 2 MB block arriving, so this only bounds
++/// starvation and does not change ordinary priority order.
++const MAX_FAIR_WAIT: Duration = Duration::from_secs(5);
++/// A request waiting longer than this is served without waiting for a free slot,
++/// well inside Zebra's 20 s request timeout.
++const MAX_GATE_WAIT: Duration = Duration::from_secs(10);
+ /// Throughput estimates older than this are forgotten.
+ const ESTIMATE_TTL: Duration = Duration::from_secs(3600);
+ /// Most peers with a stored throughput estimate.
+diff --git a/zebra-network/src/testbed/tests.rs b/zebra-network/src/testbed/tests.rs
+index ed0b501..e7062bb 100644
+--- a/zebra-network/src/testbed/tests.rs
++++ b/zebra-network/src/testbed/tests.rs
+@@ -352,19 +352,19 @@ async fn high_ranked_requester_cannot_starve_others() {
+     tokio::time::sleep(Duration::from_millis(30)).await;
+     let start = Instant::now();
+     let admitted = tokio::time::timeout(
+-        Duration::from_secs(2),
++        Duration::from_secs(8),
+         serve_blocks(Some(victim), vec![hash(200)]),
+     )
+     .await;
+     let waited = start.elapsed();
+     stop.store(true, Ordering::Relaxed);
+-    drop(admitted);
+     for a in attackers {
+         let _ = a.await;
+     }
+     println!("victim waited {waited:?}");
++    assert!(admitted.is_ok(), "victim was never admitted");
+     assert!(
+-        waited < Duration::from_millis(900),
++        waited < MAX_FAIR_WAIT + Duration::from_millis(500),
+         "victim starved for {waited:?}"
+     );
+ }
+-- 
+2.43.0
+

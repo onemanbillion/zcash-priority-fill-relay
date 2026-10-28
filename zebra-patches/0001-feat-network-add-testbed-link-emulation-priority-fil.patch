@@ -1,0 +1,1726 @@
+From 31b2f178238b35f3b2558768eab2a3760ee2fd45 Mon Sep 17 00:00:00 2001
+From: testbed <hello@paul.church>
+Date: Wed, 28 Oct 2026 09:39:35 -0500
+Subject: [PATCH 1/3] feat(network): add testbed link emulation, priority-fill
+ upload scheduler and stateless relay (experimental, not for production)
+
+---
+ Cargo.lock                                    |  13 +
+ Cargo.toml                                    |   1 +
+ zebra-network/Cargo.toml                      |   1 +
+ zebra-network/src/constants.rs                |   5 +-
+ zebra-network/src/lib.rs                      |   1 +
+ zebra-network/src/meta_addr/peer_addr.rs      |   4 +-
+ zebra-network/src/peer/connection.rs          |   9 +
+ zebra-network/src/peer/connector.rs           |   6 +-
+ zebra-network/src/peer_set.rs                 |   5 +-
+ zebra-network/src/peer_set/initialize.rs      |   5 +-
+ .../src/peer_set/initialize/tests/vectors.rs  |  18 +-
+ zebra-network/src/testbed.rs                  | 594 ++++++++++++++++++
+ zebra-network/src/testbed/tests.rs            | 306 +++++++++
+ zebra-relay/Cargo.toml                        |  14 +
+ zebra-relay/src/main.rs                       | 469 ++++++++++++++
+ 15 files changed, 1431 insertions(+), 20 deletions(-)
+ create mode 100644 zebra-network/src/testbed.rs
+ create mode 100644 zebra-network/src/testbed/tests.rs
+ create mode 100644 zebra-relay/Cargo.toml
+ create mode 100644 zebra-relay/src/main.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 9160a6b..d3ee00f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -7475,6 +7475,7 @@ dependencies = [
+  "regex",
+  "schemars 1.2.1",
+  "serde",
++ "socket2",
+  "static_assertions",
+  "tempfile",
+  "thiserror 2.0.18",
+@@ -7504,6 +7505,18 @@ dependencies = [
+  "zebra-chain",
+ ]
+ 
++[[package]]
++name = "zebra-relay"
++version = "0.1.0"
++dependencies = [
++ "futures",
++ "tokio",
++ "tower 0.4.13",
++ "tracing-subscriber",
++ "zebra-chain",
++ "zebra-network",
++]
++
+ [[package]]
+ name = "zebra-rpc"
+ version = "19.0.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index 44198f4..8329338 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -12,6 +12,7 @@ members = [
+         "zebra-utils",
+         "tower-batch-control",
+         "tower-fallback",
++        "zebra-relay",
+ ]
+ 
+ # Use the edition 2021 dependency resolver in the workspace, to match the crates
+diff --git a/zebra-network/Cargo.toml b/zebra-network/Cargo.toml
+index 0491ffb..56b48c0 100644
+--- a/zebra-network/Cargo.toml
++++ b/zebra-network/Cargo.toml
+@@ -47,6 +47,7 @@ fuzzing = []
+ bitflags = { workspace = true }
+ byteorder = { workspace = true }
+ bytes = { workspace = true }
++socket2 = "0.6"
+ chrono = { workspace = true, features = ["clock", "std"] }
+ dirs = { workspace = true }
+ hex = { workspace = true }
+diff --git a/zebra-network/src/constants.rs b/zebra-network/src/constants.rs
+index e2cd6d8..f9a63b4 100644
+--- a/zebra-network/src/constants.rs
++++ b/zebra-network/src/constants.rs
+@@ -103,7 +103,8 @@ pub const PEERSET_BUFFER_SIZE: usize = 3;
+ 
+ /// The timeout for sending a message to a remote peer,
+ /// and receiving a response from a remote peer.
+-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
++// Testbed: 20 s scaled by the experiments' time dilation factor (4).
++pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20 * 4);
+ 
+ /// The timeout for connections and handshakes when connecting to new peers.
+ ///
+@@ -250,7 +251,7 @@ pub const MIN_OUTBOUND_PEER_CONNECTION_INTERVAL: Duration = Duration::from_milli
+ ///
+ /// The inbound interval is much longer than the outbound interval, because Zebra does not
+ /// control the selection or reconnections of inbound peers.
+-pub const MIN_INBOUND_PEER_CONNECTION_INTERVAL: Duration = Duration::from_secs(1);
++pub const MIN_INBOUND_PEER_CONNECTION_INTERVAL: Duration = Duration::from_millis(20);
+ 
+ /// The minimum time between _failed_ inbound peer connections, implemented by
+ /// `peer_set::initialize::accept_inbound_connections`.
+diff --git a/zebra-network/src/lib.rs b/zebra-network/src/lib.rs
+index 556e319..aa0b83f 100644
+--- a/zebra-network/src/lib.rs
++++ b/zebra-network/src/lib.rs
+@@ -152,6 +152,7 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+ pub mod address_book_peers;
+ pub mod config;
+ pub mod constants;
++pub mod testbed;
+ 
+ mod address_book;
+ mod address_book_updater;
+diff --git a/zebra-network/src/meta_addr/peer_addr.rs b/zebra-network/src/meta_addr/peer_addr.rs
+index 5771c66..77e9a28 100644
+--- a/zebra-network/src/meta_addr/peer_addr.rs
++++ b/zebra-network/src/meta_addr/peer_addr.rs
+@@ -3,7 +3,7 @@
+ 
+ use std::{
+     fmt,
+-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
++    net::{Ipv4Addr, SocketAddr},
+     ops::{Deref, DerefMut},
+     str::FromStr,
+ };
+@@ -81,6 +81,6 @@ impl PeerSocketAddr {
+     /// Returns true if the inner [`SocketAddr`]'s IP is the localhost IP.
+     pub fn is_localhost(&self) -> bool {
+         let ip = self.0.ip();
+-        ip == Ipv4Addr::LOCALHOST || ip == Ipv6Addr::LOCALHOST
++        ip.is_loopback()
+     }
+ }
+diff --git a/zebra-network/src/peer/connection.rs b/zebra-network/src/peer/connection.rs
+index 4e5110f..c6cb52e 100644
+--- a/zebra-network/src/peer/connection.rs
++++ b/zebra-network/src/peer/connection.rs
+@@ -1606,6 +1606,15 @@ where
+                 }
+             }
+             Response::Blocks(blocks) => {
++                // Testbed: wait for this node's upload scheduler, and hold the guard while writing.
++                let _serve = crate::testbed::serve_blocks(
++                    self.connection_info
++                        .connected_addr
++                        .get_transient_addr()
++                        .map(|addr| addr.ip()),
++                )
++                .await;
++
+                 // Generate one tx message per block,
+                 // then a notfound message with all the missing block hashes.
+                 let mut missing_hashes = Vec::new();
+diff --git a/zebra-network/src/peer/connector.rs b/zebra-network/src/peer/connector.rs
+index e167d97..43f3afb 100644
+--- a/zebra-network/src/peer/connector.rs
++++ b/zebra-network/src/peer/connector.rs
+@@ -6,7 +6,6 @@ use std::{
+ };
+ 
+ use futures::prelude::*;
+-use tokio::net::TcpStream;
+ use tower::{Service, ServiceExt};
+ use tracing_futures::Instrument;
+ 
+@@ -96,9 +95,10 @@ where
+         // `zebra_network::init()` implements a connection timeout on this future.
+         // Any code outside this future does not have a timeout.
+         async move {
+-            let tcp_stream = TcpStream::connect(*addr).await?;
++            let tcp_stream = crate::testbed::connect(*addr).await?;
++            let tcp_stream = crate::testbed::wrap(tcp_stream, *addr);
+             let client = hs
+-                .oneshot(HandshakeRequest::<TcpStream> {
++                .oneshot(HandshakeRequest::<crate::testbed::ShapedStream> {
+                     data_stream: tcp_stream,
+                     connected_addr,
+                     connection_tracker,
+diff --git a/zebra-network/src/peer_set.rs b/zebra-network/src/peer_set.rs
+index 2bb8271..c829406 100644
+--- a/zebra-network/src/peer_set.rs
++++ b/zebra-network/src/peer_set.rs
+@@ -208,9 +208,10 @@ impl<C: ChainTip + Clone + Send + 'static> Service<Request> for AdvertisePeers<C
+ }
+ 
+ fn broadcast_peer_count(network: &Network, peers: usize) -> usize {
+-    if network.is_regtest() {
++    let default = if network.is_regtest() {
+         peers
+     } else {
+         peers.div_ceil(3)
+-    }
++    };
++    crate::testbed::broadcast_peer_count(peers, default)
+ }
+diff --git a/zebra-network/src/peer_set/initialize.rs b/zebra-network/src/peer_set/initialize.rs
+index 70674a0..83a3258 100644
+--- a/zebra-network/src/peer_set/initialize.rs
++++ b/zebra-network/src/peer_set/initialize.rs
+@@ -717,7 +717,7 @@ async fn accept_inbound_connections<S>(
+     zcashd_compat_peer_ips: Vec<IpAddr>,
+ ) -> Result<(), BoxError>
+ where
+-    S: Service<peer::HandshakeRequest<TcpStream>, Response = peer::Client, Error = BoxError>
++    S: Service<peer::HandshakeRequest<crate::testbed::ShapedStream>, Response = peer::Client, Error = BoxError>
+         + Clone,
+     S::Future: Send + 'static,
+ {
+@@ -897,7 +897,7 @@ async fn accept_inbound_handshake<S>(
+     handshakes: &mut JoinSet<()>,
+ ) -> Result<(), BoxError>
+ where
+-    S: Service<peer::HandshakeRequest<TcpStream>, Response = peer::Client, Error = BoxError>
++    S: Service<peer::HandshakeRequest<crate::testbed::ShapedStream>, Response = peer::Client, Error = BoxError>
+         + Clone,
+     S::Future: Send + 'static,
+ {
+@@ -914,6 +914,7 @@ where
+     handshaker.ready().await?;
+ 
+     // Construct a handshake future but do not drive it yet....
++    let tcp_stream = crate::testbed::wrap(tcp_stream, *addr);
+     let handshake = handshaker.call(HandshakeRequest {
+         data_stream: tcp_stream,
+         connected_addr,
+diff --git a/zebra-network/src/peer_set/initialize/tests/vectors.rs b/zebra-network/src/peer_set/initialize/tests/vectors.rs
+index 2c04fc8..3b0108b 100644
+--- a/zebra-network/src/peer_set/initialize/tests/vectors.rs
++++ b/zebra-network/src/peer_set/initialize/tests/vectors.rs
+@@ -971,7 +971,7 @@ async fn listener_peer_limit_one_handshake_ok_then_drop() {
+     }
+ 
+     let success_disconnect_inbound_handshaker =
+-        service_fn(|req: HandshakeRequest<TcpStream>| async move {
++        service_fn(|req: HandshakeRequest<crate::testbed::ShapedStream>| async move {
+             let HandshakeRequest {
+                 data_stream: tcp_stream,
+                 connected_addr: _,
+@@ -1030,7 +1030,7 @@ async fn listener_peer_limit_one_handshake_ok_stay_open() {
+     let (peer_tracker_tx, mut peer_tracker_rx) = mpsc::unbounded();
+ 
+     let success_stay_open_inbound_handshaker =
+-        service_fn(move |req: HandshakeRequest<TcpStream>| {
++        service_fn(move |req: HandshakeRequest<crate::testbed::ShapedStream>| {
+             let peer_tracker_tx = peer_tracker_tx.clone();
+             async move {
+                 let HandshakeRequest {
+@@ -1113,7 +1113,7 @@ async fn listener_reserves_one_zcashd_compat_inbound_slot() {
+     let (peer_tracker_tx, mut peer_tracker_rx) = mpsc::unbounded();
+ 
+     let success_stay_open_inbound_handshaker =
+-        service_fn(move |req: HandshakeRequest<TcpStream>| {
++        service_fn(move |req: HandshakeRequest<crate::testbed::ShapedStream>| {
+             let peer_tracker_tx = peer_tracker_tx.clone();
+             async move {
+                 let HandshakeRequest {
+@@ -1216,7 +1216,7 @@ async fn listener_zcashd_compat_reconnect_bypasses_recent_ip_limit() {
+ 
+     let zcashd_compat_ip = Ipv4Addr::new(127, 0, 0, 2);
+     let success_disconnect_inbound_handshaker =
+-        service_fn(|req: HandshakeRequest<TcpStream>| async move {
++        service_fn(|req: HandshakeRequest<crate::testbed::ShapedStream>| async move {
+             let HandshakeRequest {
+                 data_stream: tcp_stream,
+                 connected_addr,
+@@ -1355,7 +1355,7 @@ async fn listener_canonicalizes_ipv4_mapped_inbound_addrs() {
+     let (peer_tracker_tx, mut peer_tracker_rx) = mpsc::unbounded();
+ 
+     let success_stay_open_inbound_handshaker =
+-        service_fn(move |req: HandshakeRequest<TcpStream>| {
++        service_fn(move |req: HandshakeRequest<crate::testbed::ShapedStream>| {
+             let peer_tracker_tx = peer_tracker_tx.clone();
+             async move {
+                 let HandshakeRequest {
+@@ -1704,7 +1704,7 @@ async fn listener_peer_limit_default_handshake_ok_then_drop() {
+     }
+ 
+     let success_disconnect_inbound_handshaker =
+-        service_fn(|req: HandshakeRequest<TcpStream>| async move {
++        service_fn(|req: HandshakeRequest<crate::testbed::ShapedStream>| async move {
+             let HandshakeRequest {
+                 data_stream: tcp_stream,
+                 connected_addr: _,
+@@ -1763,7 +1763,7 @@ async fn listener_peer_limit_default_handshake_ok_stay_open() {
+     let (peer_tracker_tx, mut peer_tracker_rx) = mpsc::unbounded();
+ 
+     let success_stay_open_inbound_handshaker =
+-        service_fn(move |req: HandshakeRequest<TcpStream>| {
++        service_fn(move |req: HandshakeRequest<crate::testbed::ShapedStream>| {
+             let peer_tracker_tx = peer_tracker_tx.clone();
+             async move {
+                 let HandshakeRequest {
+@@ -2390,7 +2390,7 @@ async fn connect_from(source_ip: Ipv4Addr, listen_addr: SocketAddr) -> TcpStream
+ 
+ /// Drains the accepted inbound peer tracker channel, returning the accepted peer IPs.
+ fn drain_accepted_inbound_ips(
+-    peer_tracker_rx: &mut mpsc::UnboundedReceiver<(IpAddr, TcpStream, ConnectionTracker)>,
++    peer_tracker_rx: &mut mpsc::UnboundedReceiver<(IpAddr, crate::testbed::ShapedStream, ConnectionTracker)>,
+ ) -> Vec<Ipv4Addr> {
+     let mut accepted_ips = Vec::new();
+ 
+@@ -2439,7 +2439,7 @@ async fn spawn_inbound_listener_with_peer_limit<S>(
+     listen_handshaker: S,
+ ) -> (Config, mpsc::Receiver<DiscoveredPeer>)
+ where
+-    S: Service<peer::HandshakeRequest<TcpStream>, Response = peer::Client, Error = BoxError>
++    S: Service<peer::HandshakeRequest<crate::testbed::ShapedStream>, Response = peer::Client, Error = BoxError>
+         + Clone
+         + Send
+         + Sync
+diff --git a/zebra-network/src/testbed.rs b/zebra-network/src/testbed.rs
+new file mode 100644
+index 0000000..b15e401
+--- /dev/null
++++ b/zebra-network/src/testbed.rs
+@@ -0,0 +1,594 @@
++//! Testbed-only instrumentation for block relay experiments. Not for production use.
++//!
++//! When [`install`] is called, every peer TCP connection is wrapped in a [`ShapedStream`]:
++//! - this node's total upload and download are limited by shared token buckets,
++//! - incoming bytes are delayed by a deterministic per-link one-way latency,
++//! - kernel socket buffers are kept small so slow receivers apply backpressure.
++//!
++//! It also provides the experimental "priority fill" upload scheduler for block responses,
++//! and the block advert fanout switch (one third of peers, like Mainnet, or all peers).
++
++use std::{
++    collections::{HashMap, VecDeque},
++    future::Future,
++    io::{self, Write},
++    net::{IpAddr, SocketAddr},
++    pin::Pin,
++    sync::{
++        atomic::{AtomicU64, Ordering},
++        Arc, Mutex, OnceLock,
++    },
++    task::{Context, Poll},
++    time::Duration,
++};
++
++use bytes::Bytes;
++use tokio::{
++    io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
++    net::{
++        tcp::{OwnedReadHalf, OwnedWriteHalf},
++        TcpSocket, TcpStream,
++    },
++    sync::{mpsc, oneshot},
++    time::{Instant, Sleep},
++};
++
++/// Maximum bytes moved per read or write call.
++const CHUNK: usize = 16 * 1024;
++/// Kernel socket buffer size, small so backpressure reaches the sender quickly.
++const SOCK_BUF: usize = 32 * 1024;
++/// Bytes of a contiguous receive burst needed before it counts as a throughput sample.
++const MIN_SAMPLE_BYTES: u64 = 256 * 1024;
++/// A pause longer than this ends a receive burst.
++const BURST_GAP: Duration = Duration::from_millis(150);
++/// Upload utilization below this fraction lets the scheduler admit another transfer.
++const ADMIT_UTILIZATION: f64 = 0.85;
++/// Minimum time between admissions while other transfers are active.
++const RAMP: Duration = Duration::from_millis(50);
++/// Window used to measure upload utilization.
++const UTIL_WINDOW: Duration = Duration::from_millis(100);
++
++/// Testbed settings for this node.
++#[derive(Clone, Debug)]
++pub struct TestbedConfig {
++    /// This node's IP address. Outbound connections bind to it.
++    pub own_ip: IpAddr,
++    /// Upload capacity, megabits per second.
++    pub upload_mbps: f64,
++    /// Download capacity, megabits per second.
++    pub download_mbps: f64,
++    /// Seed for per-link latencies (all nodes must use the same seed).
++    pub latency_seed: u64,
++    /// Minimum one-way link latency, milliseconds.
++    pub latency_min_ms: f64,
++    /// Maximum one-way link latency, milliseconds.
++    pub latency_max_ms: f64,
++    /// Use the priority-fill upload scheduler for block responses.
++    pub priority_upload: bool,
++    /// Advertise relayed blocks to every peer, rather than one third of them (Mainnet behaviour).
++    pub advertise_to_all: bool,
++    /// Optional event log file.
++    pub log_path: Option<String>,
++    /// Time dilation factor applied to the scheduler's internal timings.
++    pub time_scale: f64,
++}
++
++struct Testbed {
++    cfg: TestbedConfig,
++    up: Arc<Bucket>,
++    down: Arc<Bucket>,
++    peer_rates: Mutex<HashMap<IpAddr, f64>>,
++    gate: Mutex<GateInner>,
++    log: Option<Mutex<std::fs::File>>,
++}
++
++static TESTBED: OnceLock<Testbed> = OnceLock::new();
++
++fn scaled(d: Duration) -> Duration {
++    TESTBED
++        .get()
++        .map(|tb| d.mul_f64(tb.cfg.time_scale))
++        .unwrap_or(d)
++}
++
++/// Installs the testbed. Must be called inside a Tokio runtime, before `zebra_network::init`.
++pub fn install(cfg: TestbedConfig) {
++    let log = cfg.log_path.as_ref().map(|p| {
++        Mutex::new(
++            std::fs::OpenOptions::new()
++                .create(true)
++                .append(true)
++                .open(p)
++                .expect("testbed log path is writable"),
++        )
++    });
++    let tb = Testbed {
++        up: Arc::new(Bucket::new(cfg.upload_mbps * 1e6 / 8.0)),
++        down: Arc::new(Bucket::new(cfg.download_mbps * 1e6 / 8.0)),
++        peer_rates: Mutex::new(HashMap::new()),
++        gate: Mutex::new(GateInner::default()),
++        log,
++        cfg,
++    };
++    if TESTBED.set(tb).is_err() {
++        panic!("testbed installed twice");
++    }
++    if !TESTBED.get().expect("just set").cfg.priority_upload {
++        return;
++    }
++    tokio::spawn(async {
++        let mut tick = tokio::time::interval(scaled(Duration::from_millis(10)));
++        loop {
++            tick.tick().await;
++            if let Some(tb) = TESTBED.get() {
++                tb.pump();
++            }
++        }
++    });
++}
++
++/// Writes one line to the testbed event log.
++pub fn log_event(line: &str) {
++    if let Some(tb) = TESTBED.get() {
++        if let Some(log) = &tb.log {
++            let ms = std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .map(|d| d.as_micros())
++                .unwrap_or_default();
++            let mut f = log.lock().expect("log lock is not poisoned");
++            let _ = writeln!(f, "{} {}", ms, line);
++        }
++    }
++}
++
++/// Returns this node's current throughput estimates for its peers, in megabits per second.
++pub fn peer_rate_estimates() -> Vec<(IpAddr, f64)> {
++    TESTBED
++        .get()
++        .map(|tb| {
++            tb.peer_rates
++                .lock()
++                .expect("lock is not poisoned")
++                .iter()
++                .map(|(ip, r)| (*ip, r * 8.0 / 1e6))
++                .collect()
++        })
++        .unwrap_or_default()
++}
++
++/// Seeds this node's throughput estimate for a peer, in megabits per second
++/// (for experiments that start from a long-running node's state).
++pub fn seed_peer_rate(peer: IpAddr, mbps: f64) {
++    if let Some(tb) = TESTBED.get() {
++        tb.peer_rates
++            .lock()
++            .expect("lock is not poisoned")
++            .insert(peer, mbps * 1e6 / 8.0);
++    }
++}
++
++/// How many of `peers` connected peers a relayed block advert goes to.
++pub(crate) fn broadcast_peer_count(peers: usize, default: usize) -> usize {
++    match TESTBED.get() {
++        Some(tb) if tb.cfg.advertise_to_all => peers,
++        Some(_) => peers.div_ceil(3),
++        None => default,
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// Token buckets
++
++struct Bucket {
++    rate: f64,
++    burst: f64,
++    state: Mutex<(f64, Instant)>,
++    total: AtomicU64,
++}
++
++impl Bucket {
++    fn new(rate: f64) -> Self {
++        let burst = (rate * 0.005).max(32.0 * 1024.0);
++        Bucket {
++            rate,
++            burst,
++            state: Mutex::new((burst, Instant::now())),
++            total: AtomicU64::new(0),
++        }
++    }
++
++    fn unlimited() -> Self {
++        Self::new(f64::INFINITY)
++    }
++
++    fn refill(&self, st: &mut (f64, Instant)) {
++        if !self.rate.is_finite() {
++            st.0 = 0.0;
++            return;
++        }
++        let now = Instant::now();
++        let dt = now.saturating_duration_since(st.1).as_secs_f64();
++        st.0 = (st.0 + dt * self.rate).min(self.burst);
++        st.1 = now;
++    }
++
++    /// How long to wait before sending more, if the bucket is in debt.
++    fn wait(&self) -> Option<Duration> {
++        let mut st = self.state.lock().expect("lock is not poisoned");
++        self.refill(&mut st);
++        if st.0 >= 0.0 {
++            None
++        } else {
++            Some(Duration::from_secs_f64(-st.0 / self.rate).max(Duration::from_millis(1)))
++        }
++    }
++
++    fn consume(&self, n: usize) {
++        let mut st = self.state.lock().expect("lock is not poisoned");
++        self.refill(&mut st);
++        if self.rate.is_finite() {
++            st.0 -= n as f64;
++        }
++        self.total.fetch_add(n as u64, Ordering::Relaxed);
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// Shaped streams
++
++/// A peer connection with emulated bandwidth and latency.
++pub struct ShapedStream {
++    write: OwnedWriteHalf,
++    rx: mpsc::Receiver<(Instant, Bytes)>,
++    pending: Option<(Instant, Bytes)>,
++    read_sleep: Option<Pin<Box<Sleep>>>,
++    write_sleep: Option<Pin<Box<Sleep>>>,
++    up: Arc<Bucket>,
++}
++
++fn link_latency(a: IpAddr, b: IpAddr) -> Duration {
++    let Some(tb) = TESTBED.get() else {
++        return Duration::ZERO;
++    };
++    let key = |ip: IpAddr| match ip {
++        IpAddr::V4(v4) => u32::from(v4) as u64,
++        IpAddr::V6(v6) => u128::from(v6) as u64,
++    };
++    let (x, y) = (key(a).min(key(b)), key(a).max(key(b)));
++    // splitmix64
++    let mut z = tb.cfg.latency_seed ^ (x << 32) ^ y;
++    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
++    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
++    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
++    z ^= z >> 31;
++    let u = (z >> 11) as f64 / (1u64 << 53) as f64;
++    let ms = tb.cfg.latency_min_ms + u * (tb.cfg.latency_max_ms - tb.cfg.latency_min_ms);
++    Duration::from_secs_f64(ms / 1000.0)
++}
++
++/// Opens an outbound connection, bound to this node's testbed IP when installed.
++pub(crate) async fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
++    let Some(tb) = TESTBED.get() else {
++        return TcpStream::connect(addr).await;
++    };
++    // Testbed nodes start together, so a peer's listener may not be open yet: retry refusals
++    // briefly instead of waiting minutes for Zebra's reconnection delay.
++    let deadline = Instant::now() + Duration::from_millis(2500);
++    loop {
++        let sock = if addr.is_ipv4() {
++            TcpSocket::new_v4()?
++        } else {
++            TcpSocket::new_v6()?
++        };
++        sock.bind(SocketAddr::new(tb.cfg.own_ip, 0))?;
++        sock.set_send_buffer_size(SOCK_BUF as u32)?;
++        sock.set_recv_buffer_size(SOCK_BUF as u32)?;
++        match sock.connect(addr).await {
++            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused && Instant::now() < deadline => {
++                tokio::time::sleep(Duration::from_millis(100)).await;
++            }
++            other => return other,
++        }
++    }
++}
++
++/// Wraps a connected peer stream in the testbed link emulation.
++pub(crate) fn wrap(stream: TcpStream, peer: SocketAddr) -> ShapedStream {
++    let (up, down, lat) = match TESTBED.get() {
++        Some(tb) => {
++            let sref = socket2::SockRef::from(&stream);
++            let _ = sref.set_send_buffer_size(SOCK_BUF);
++            let _ = sref.set_recv_buffer_size(SOCK_BUF);
++            (tb.up.clone(), tb.down.clone(), link_latency(tb.cfg.own_ip, peer.ip()))
++        }
++        None => (Arc::new(Bucket::unlimited()), Arc::new(Bucket::unlimited()), Duration::ZERO),
++    };
++    let _ = stream.set_nodelay(true);
++    let (read, write) = stream.into_split();
++    let (tx, rx) = mpsc::channel(256);
++    tokio::spawn(reader(read, tx, down, lat, peer.ip()));
++    ShapedStream {
++        write,
++        rx,
++        pending: None,
++        read_sleep: None,
++        write_sleep: None,
++        up,
++    }
++}
++
++async fn reader(
++    mut read: OwnedReadHalf,
++    tx: mpsc::Sender<(Instant, Bytes)>,
++    down: Arc<Bucket>,
++    lat: Duration,
++    peer: IpAddr,
++) {
++    let mut buf = vec![0u8; CHUNK];
++    let mut burst: Option<(Instant, Instant, u64, usize)> = None; // start, last, bytes, first chunk
++    loop {
++        while let Some(d) = down.wait() {
++            tokio::time::sleep(d).await;
++        }
++        let n = match read.read(&mut buf).await {
++            Ok(0) | Err(_) => break,
++            Ok(n) => n,
++        };
++        down.consume(n);
++        let now = Instant::now();
++        match &mut burst {
++            Some((_, last, bytes, _)) if now.saturating_duration_since(*last) <= scaled(BURST_GAP) => {
++                *bytes += n as u64;
++                *last = now;
++            }
++            _ => {
++                if let Some(b) = burst.take() {
++                    record_burst(peer, b);
++                }
++                burst = Some((now, now, n as u64, n));
++            }
++        }
++        if tx
++            .send((now + lat, Bytes::copy_from_slice(&buf[..n])))
++            .await
++            .is_err()
++        {
++            break;
++        }
++    }
++    if let Some(b) = burst.take() {
++        record_burst(peer, b);
++    }
++}
++
++fn record_burst(peer: IpAddr, (start, last, bytes, first): (Instant, Instant, u64, usize)) {
++    let dur = last.saturating_duration_since(start).as_secs_f64();
++    if bytes < MIN_SAMPLE_BYTES || dur <= 0.0 {
++        return;
++    }
++    let rate = (bytes - first as u64) as f64 / dur;
++    if let Some(tb) = TESTBED.get() {
++        let mut rates = tb.peer_rates.lock().expect("lock is not poisoned");
++        let e = rates.entry(peer).or_insert(rate);
++        *e = 0.5 * *e + 0.5 * rate;
++        drop(rates);
++        log_event(&format!("RATE {} {:.1}", peer, rate * 8.0 / 1e6));
++    }
++}
++
++impl AsyncRead for ShapedStream {
++    fn poll_read(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        out: &mut ReadBuf<'_>,
++    ) -> Poll<io::Result<()>> {
++        let this = &mut *self;
++        if this.pending.is_none() {
++            match this.rx.poll_recv(cx) {
++                Poll::Ready(Some(item)) => this.pending = Some(item),
++                Poll::Ready(None) => return Poll::Ready(Ok(())),
++                Poll::Pending => return Poll::Pending,
++            }
++        }
++        let due = this.pending.as_ref().expect("just set").0;
++        if Instant::now() < due {
++            let sleep = this
++                .read_sleep
++                .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(due)));
++            if sleep.deadline() != due {
++                sleep.as_mut().reset(due);
++            }
++            if sleep.as_mut().poll(cx).is_pending() {
++                return Poll::Pending;
++            }
++        }
++        this.read_sleep = None;
++        let (_, bytes) = this.pending.as_mut().expect("just set");
++        let n = out.remaining().min(bytes.len());
++        out.put_slice(&bytes.split_to(n));
++        if bytes.is_empty() {
++            this.pending = None;
++        }
++        Poll::Ready(Ok(()))
++    }
++}
++
++impl AsyncWrite for ShapedStream {
++    fn poll_write(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &[u8],
++    ) -> Poll<io::Result<usize>> {
++        let this = &mut *self;
++        loop {
++            if let Some(sleep) = this.write_sleep.as_mut() {
++                futures::ready!(sleep.as_mut().poll(cx));
++                this.write_sleep = None;
++            }
++            match this.up.wait() {
++                Some(d) => this.write_sleep = Some(Box::pin(tokio::time::sleep(d))),
++                None => break,
++            }
++        }
++        let n = buf.len().min(CHUNK);
++        match Pin::new(&mut this.write).poll_write(cx, &buf[..n]) {
++            Poll::Ready(Ok(w)) => {
++                this.up.consume(w);
++                Poll::Ready(Ok(w))
++            }
++            other => other,
++        }
++    }
++
++    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Pin::new(&mut self.write).poll_flush(cx)
++    }
++
++    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Pin::new(&mut self.write).poll_shutdown(cx)
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// Priority-fill upload scheduler
++
++#[derive(Default)]
++struct GateInner {
++    active: usize,
++    waiting: Vec<(f64, u64, oneshot::Sender<()>)>,
++    next_id: u64,
++    last_admit: Option<Instant>,
++    samples: VecDeque<(Instant, u64)>,
++}
++
++impl Testbed {
++    fn rate_estimate(&self, peer: Option<IpAddr>) -> f64 {
++        let rates = self.peer_rates.lock().expect("lock is not poisoned");
++        if let Some(r) = peer.and_then(|p| rates.get(&p)) {
++            return *r;
++        }
++        if rates.is_empty() {
++            return 50e6 / 8.0;
++        }
++        let mut v: Vec<f64> = rates.values().copied().collect();
++        v.sort_by(|a, b| a.partial_cmp(b).expect("rates are finite"));
++        v[v.len() / 2]
++    }
++
++    fn utilization(&self, g: &GateInner) -> f64 {
++        let (Some(first), Some(last)) = (g.samples.front(), g.samples.back()) else {
++            return 1.0;
++        };
++        let dt = last.0.saturating_duration_since(first.0).as_secs_f64();
++        if dt < scaled(UTIL_WINDOW).as_secs_f64() * 0.5 {
++            return 1.0;
++        }
++        (last.1 - first.1) as f64 / (self.up.rate * dt)
++    }
++
++    /// Samples upload utilization and admits waiting transfers if there is spare capacity.
++    fn pump(&self) {
++        let now = Instant::now();
++        let mut g = self.gate.lock().expect("lock is not poisoned");
++        g.samples
++            .push_back((now, self.up.total.load(Ordering::Relaxed)));
++        while g
++            .samples
++            .front()
++            .is_some_and(|(t, _)| now.saturating_duration_since(*t) > scaled(UTIL_WINDOW))
++        {
++            g.samples.pop_front();
++        }
++        self.admit(&mut g, now);
++    }
++
++    fn admit(&self, g: &mut GateInner, now: Instant) {
++        loop {
++            if g.waiting.is_empty() {
++                return;
++            }
++            let spare = g.active == 0
++                || (g
++                    .last_admit
++                    .is_none_or(|t| now.saturating_duration_since(t) >= scaled(RAMP))
++                    && self.utilization(g) < ADMIT_UTILIZATION);
++            if !spare {
++                return;
++            }
++            // Highest estimated relay rate first, then earliest request.
++            let best = g
++                .waiting
++                .iter()
++                .enumerate()
++                .max_by(|(_, a), (_, b)| {
++                    a.0.partial_cmp(&b.0)
++                        .expect("rates are finite")
++                        .then(b.1.cmp(&a.1))
++                })
++                .map(|(i, _)| i)
++                .expect("waiting is not empty");
++            let (_, _, tx) = g.waiting.swap_remove(best);
++            if tx.send(()).is_ok() {
++                g.active += 1;
++                g.last_admit = Some(now);
++                if g.active > 1 {
++                    return;
++                }
++            }
++        }
++    }
++}
++
++/// Held while a block response is being written to a peer.
++pub(crate) struct ServeGuard {
++    peer: Option<IpAddr>,
++    gated: bool,
++}
++
++impl Drop for ServeGuard {
++    fn drop(&mut self) {
++        let Some(tb) = TESTBED.get() else { return };
++        log_event(&format!(
++            "SERVE_END {}",
++            self.peer.map(|p| p.to_string()).unwrap_or_default()
++        ));
++        if self.gated {
++            let mut g = tb.gate.lock().expect("lock is not poisoned");
++            g.active = g.active.saturating_sub(1);
++            tb.admit(&mut g, Instant::now());
++        }
++    }
++}
++
++/// Waits until this node's upload scheduler lets a block response to `peer` start.
++pub(crate) async fn serve_blocks(peer: Option<IpAddr>) -> Option<ServeGuard> {
++    let tb = TESTBED.get()?;
++    let peer_label = peer.map(|p| p.to_string()).unwrap_or_default();
++    if !tb.cfg.priority_upload {
++        log_event(&format!("SERVE_START {} 0", peer_label));
++        return Some(ServeGuard { peer, gated: false });
++    }
++    let est = tb.rate_estimate(peer);
++    let (tx, rx) = oneshot::channel();
++    {
++        let mut g = tb.gate.lock().expect("lock is not poisoned");
++        let id = g.next_id;
++        g.next_id += 1;
++        g.waiting.push((est, id, tx));
++        tb.admit(&mut g, Instant::now());
++    }
++    let queued = Instant::now();
++    if rx.await.is_err() {
++        return None;
++    }
++    log_event(&format!(
++        "SERVE_START {} {:.0} est={:.1}",
++        peer_label,
++        queued.elapsed().as_secs_f64() * 1000.0,
++        est * 8.0 / 1e6
++    ));
++    Some(ServeGuard { peer, gated: true })
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/zebra-network/src/testbed/tests.rs b/zebra-network/src/testbed/tests.rs
+new file mode 100644
+index 0000000..1b7f057
+--- /dev/null
++++ b/zebra-network/src/testbed/tests.rs
+@@ -0,0 +1,306 @@
++//! Tests for the testbed link emulation and upload scheduler.
++//!
++//! Each test installs (or deliberately does not install) the process-global testbed,
++//! so these must run one test per process (`cargo nextest`).
++
++#![allow(clippy::print_stdout)]
++
++use std::{net::Ipv4Addr, time::Duration};
++
++use tokio::{
++    io::{AsyncReadExt, AsyncWriteExt},
++    net::{TcpListener, TcpStream},
++};
++
++use super::*;
++
++fn cfg(priority: bool) -> TestbedConfig {
++    TestbedConfig {
++        own_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
++        upload_mbps: 100.0,
++        download_mbps: 100.0,
++        latency_seed: 1,
++        latency_min_ms: 5.0,
++        latency_max_ms: 10.0,
++        priority_upload: priority,
++        advertise_to_all: false,
++        log_path: None,
++        time_scale: 1.0,
++    }
++}
++
++/// A connected pair: (raw client socket, server side wrapped in a ShapedStream).
++async fn pair() -> (TcpStream, ShapedStream) {
++    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
++    let addr = listener.local_addr().expect("addr");
++    let client = TcpStream::connect(addr).await.expect("connect");
++    let (server, peer) = listener.accept().await.expect("accept");
++    (client, wrap(server, peer))
++}
++
++fn open_fds() -> usize {
++    std::fs::read_dir("/proc/self/fd").map(|d| d.count()).unwrap_or(0)
++}
++
++fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
++    let mut z = seed;
++    (0..len)
++        .map(|_| {
++            z = z.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
++            (z >> 33) as u8
++        })
++        .collect()
++}
++
++/// Bytes written in odd-sized pieces arrive intact and in order, in both directions.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn stream_integrity_without_install() {
++    let (mut client, mut server) = pair().await;
++    let data = pseudo_random(3 * 1024 * 1024 + 17, 7);
++    let send = data.clone();
++    let writer = tokio::spawn(async move {
++        let mut off = 0;
++        let mut step = 1;
++        while off < send.len() {
++            let end = (off + step).min(send.len());
++            client.write_all(&send[off..end]).await.expect("write");
++            off = end;
++            step = (step * 7 + 3) % 70_001 + 1;
++        }
++        client.shutdown().await.expect("shutdown");
++        client
++    });
++    let mut got = Vec::new();
++    server.read_to_end(&mut got).await.expect("read");
++    assert_eq!(got.len(), data.len());
++    assert!(got == data, "stream corrupted");
++
++    // and the other direction, through the shaped writer
++    let mut client = writer.await.expect("join");
++    let back = pseudo_random(2 * 1024 * 1024 + 5, 9);
++    server.write_all(&back).await.expect("write back");
++    server.shutdown().await.expect("shutdown back");
++    let mut got = Vec::new();
++    client.read_to_end(&mut got).await.expect("read back");
++    assert!(got == back, "reverse stream corrupted");
++}
++
++/// With the testbed installed, data still arrives intact through shaping and latency.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn stream_integrity_with_install() {
++    install(cfg(false));
++    let (mut client, mut server) = pair().await;
++    let data = pseudo_random(2 * 1024 * 1024, 11);
++    let send = data.clone();
++    tokio::spawn(async move {
++        client.write_all(&send).await.expect("write");
++        client.shutdown().await.expect("shutdown");
++        // keep the socket open until the reader finishes
++        tokio::time::sleep(Duration::from_secs(5)).await;
++    });
++    let start = Instant::now();
++    let mut got = Vec::new();
++    server.read_to_end(&mut got).await.expect("read");
++    assert!(got == data, "stream corrupted under shaping");
++    // 2 MiB at 100 Mb/s download takes about 168 ms
++    let took = start.elapsed();
++    assert!(took >= Duration::from_millis(140), "download not shaped: {took:?}");
++}
++
++/// FINDING: dropping a ShapedStream does not close its socket while the peer stays silent,
++/// because the detached reader task still owns the read half.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn dropped_stream_leaks_socket_while_peer_is_silent() {
++    let before = open_fds();
++    let mut clients = Vec::new();
++    for _ in 0..50 {
++        let (client, server) = pair().await;
++        drop(server); // what Zebra does when it disconnects or bans a peer
++        clients.push(client); // the "attacker" keeps its end open and never sends
++    }
++    tokio::time::sleep(Duration::from_millis(500)).await;
++    let after = open_fds();
++    // 50 client sockets are expected; anything above that is a leaked server socket.
++    let leaked = after.saturating_sub(before).saturating_sub(50);
++    println!("fds before {before}, after {after}, leaked server sockets: {leaked}");
++    assert!(leaked >= 45, "expected the leak to reproduce, got {leaked}");
++
++    // control: plain TcpStream closes immediately
++    let before = open_fds();
++    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
++    let addr = listener.local_addr().expect("addr");
++    let mut plain_clients = Vec::new();
++    for _ in 0..50 {
++        let c = TcpStream::connect(addr).await.expect("connect");
++        let (s, _) = listener.accept().await.expect("accept");
++        drop(s);
++        plain_clients.push(c);
++    }
++    tokio::time::sleep(Duration::from_millis(200)).await;
++    let leaked_plain = open_fds().saturating_sub(before).saturating_sub(51);
++    println!("plain TcpStream leaked: {leaked_plain}");
++    assert_eq!(leaked_plain, 0);
++}
++
++/// FINDING: the reader task buffers far more unread data than the kernel would,
++/// removing TCP backpressure (memory per connection grows to the channel's size).
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn unread_data_is_buffered_in_userspace() {
++    async fn accepted_without_reading(wrapped: bool) -> usize {
++        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
++        let addr = listener.local_addr().expect("addr");
++        let mut client = TcpStream::connect(addr).await.expect("connect");
++        let (server, peer) = listener.accept().await.expect("accept");
++        let _hold: Box<dyn std::any::Any + Send> = if wrapped {
++            Box::new(wrap(server, peer))
++        } else {
++            Box::new(server)
++        };
++        let chunk = vec![0u8; 64 * 1024];
++        let mut sent = 0;
++        loop {
++            match tokio::time::timeout(Duration::from_millis(300), client.write(&chunk)).await {
++                Ok(Ok(n)) => sent += n,
++                _ => break,
++            }
++            if sent > 64 * 1024 * 1024 {
++                break;
++            }
++        }
++        sent
++    }
++    let plain = accepted_without_reading(false).await;
++    let shaped = accepted_without_reading(true).await;
++    println!("bytes accepted with nobody reading: plain {plain}, shaped {shaped}");
++    assert!(shaped > plain + 2 * 1024 * 1024, "expected extra userspace buffering");
++}
++
++/// The scheduler serves the highest-estimate waiting peer first.
++#[tokio::test(flavor = "current_thread")]
++async fn gate_admits_highest_estimate_first() {
++    install(cfg(true));
++    let slow: IpAddr = "10.0.0.1".parse().expect("ip");
++    let fast: IpAddr = "10.0.0.2".parse().expect("ip");
++    let mid: IpAddr = "10.0.0.3".parse().expect("ip");
++    seed_peer_rate(slow, 5.0);
++    seed_peer_rate(fast, 500.0);
++    seed_peer_rate(mid, 50.0);
++
++    // Occupy the uplink so the others must queue.
++    let first = serve_blocks(Some(slow)).await.expect("first admitted at once");
++    let order = Arc::new(Mutex::new(Vec::new()));
++    let mut tasks = Vec::new();
++    for ip in [mid, fast] {
++        let order = order.clone();
++        tasks.push(tokio::spawn(async move {
++            let g = serve_blocks(Some(ip)).await.expect("admitted");
++            order.lock().expect("lock").push(ip);
++            tokio::time::sleep(Duration::from_millis(5)).await;
++            drop(g);
++        }));
++    }
++    tokio::task::yield_now().await;
++    // Fake full utilization so nothing else is admitted while `first` is active.
++    TESTBED.get().expect("installed").up.total.fetch_add(1 << 40, Ordering::Relaxed);
++    drop(first);
++    for t in tasks {
++        t.await.expect("join");
++    }
++    let order = order.lock().expect("lock").clone();
++    assert_eq!(order.first(), Some(&fast), "fast peer should be served first: {order:?}");
++}
++
++/// FINDING: a request cancelled after it was admitted, but before it ran, leaks a slot.
++#[tokio::test(flavor = "current_thread")]
++async fn cancelled_admission_leaks_an_active_slot() {
++    install(cfg(true));
++    let a: IpAddr = "10.0.0.1".parse().expect("ip");
++    let b: IpAddr = "10.0.0.2".parse().expect("ip");
++    let first = serve_blocks(Some(a)).await.expect("admitted");
++    let waiter = tokio::spawn(serve_blocks(Some(b)));
++    tokio::task::yield_now().await; // waiter is now queued
++    drop(first); // admits the waiter: its oneshot fires
++    waiter.abort(); // the connection is torn down before the task runs again
++    let _ = waiter.await;
++    let active = TESTBED.get().expect("installed").gate.lock().expect("lock").active;
++    println!("active slots with no transfer running: {active}");
++    assert_eq!(active, 1, "expected the leaked slot to reproduce");
++}
++
++/// FINDING: a NaN estimate (from a malformed seed file) panics the scheduler.
++#[tokio::test(flavor = "current_thread")]
++async fn nan_estimate_panics_scheduler() {
++    install(cfg(true));
++    seed_peer_rate("10.0.0.9".parse().expect("ip"), f64::NAN);
++    seed_peer_rate("10.0.0.8".parse().expect("ip"), 10.0);
++    let result = tokio::spawn(serve_blocks(Some("10.0.0.7".parse().expect("ip")))).await;
++    assert!(result.is_err(), "expected a panic from the NaN comparison");
++}
++
++/// FINDING: any large inbound burst counts as throughput, so a peer can raise its own
++/// priority by sending unsolicited bulk data.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn unsolicited_bulk_data_raises_priority() {
++    install(cfg(true));
++    let (mut client, mut server) = pair().await;
++    let peer_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
++    assert!(TESTBED.get().expect("installed").peer_rates.lock().expect("lock").get(&peer_ip).is_none());
++    let drain = tokio::spawn(async move {
++        let mut buf = vec![0u8; 65536];
++        while let Ok(n) = server.read(&mut buf).await {
++            if n == 0 {
++                break;
++            }
++        }
++    });
++    client.write_all(&vec![0xAB; 600 * 1024]).await.expect("junk");
++    tokio::time::sleep(Duration::from_millis(400)).await; // end the burst
++    client.write_all(b"x").await.expect("one more byte finalizes the sample");
++    tokio::time::sleep(Duration::from_millis(100)).await;
++    let est = TESTBED.get().expect("installed").peer_rates.lock().expect("lock").get(&peer_ip).copied();
++    println!("estimate after 600 KiB of junk: {:?} Mb/s", est.map(|r| r * 8.0 / 1e6));
++    assert!(est.is_some(), "junk data created a throughput estimate");
++    drop(client);
++    let _ = drain.await;
++}
++
++/// FINDING: strict priority with no aging lets a high-ranked peer that keeps re-requesting
++/// starve a low-ranked peer indefinitely while the uplink stays busy.
++#[tokio::test(flavor = "current_thread")]
++async fn high_ranked_requester_can_starve_others() {
++    install(cfg(true));
++    let attacker: IpAddr = "10.0.0.66".parse().expect("ip");
++    let victim: IpAddr = "10.0.0.5".parse().expect("ip");
++    seed_peer_rate(attacker, 1000.0);
++    seed_peer_rate(victim, 10.0);
++    let tb = TESTBED.get().expect("installed");
++
++    // Two attacker request streams, so one is always queued when the other finishes.
++    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
++    let mut attackers = Vec::new();
++    for _ in 0..2 {
++        let stop = stop.clone();
++        attackers.push(tokio::spawn(async move {
++            while !stop.load(Ordering::Relaxed) {
++                let g = serve_blocks(Some(attacker)).await;
++                // a fast transfer that keeps the uplink saturated (100 Mb/s for 20 ms)
++                tb.up.total.fetch_add(250_000, Ordering::Relaxed);
++                tokio::time::sleep(Duration::from_millis(20)).await;
++                drop(g);
++            }
++        }));
++    }
++    tokio::time::sleep(Duration::from_millis(30)).await;
++    let start = Instant::now();
++    let victim_wait = tokio::time::timeout(Duration::from_secs(2), serve_blocks(Some(victim))).await;
++    stop.store(true, Ordering::Relaxed);
++    for a in attackers {
++        let _ = a.await;
++    }
++    println!(
++        "victim admitted: {}, waited {:?}",
++        victim_wait.is_ok(),
++        start.elapsed()
++    );
++    assert!(victim_wait.is_err(), "expected the victim to be starved for 2 s");
++}
+diff --git a/zebra-relay/Cargo.toml b/zebra-relay/Cargo.toml
+new file mode 100644
+index 0000000..77e686b
+--- /dev/null
++++ b/zebra-relay/Cargo.toml
+@@ -0,0 +1,14 @@
++[package]
++name = "zebra-relay"
++version = "0.1.0"
++edition = "2021"
++publish = false
++description = "Testbed-only stateless block relay built on zebra-network"
++
++[dependencies]
++zebra-network = { path = "../zebra-network" }
++zebra-chain = { path = "../zebra-chain" }
++tokio = { workspace = true, features = ["full"] }
++tower = { workspace = true, features = ["util"] }
++futures = { workspace = true }
++tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+diff --git a/zebra-relay/src/main.rs b/zebra-relay/src/main.rs
+new file mode 100644
+index 0000000..0be9cae
+--- /dev/null
++++ b/zebra-relay/src/main.rs
+@@ -0,0 +1,469 @@
++//! Testbed-only stateless block relay built on Zebra's networking stack.
++//!
++//! It keeps no chain state and does no consensus validation. It uses zebra-network's real
++//! handshake, codec, peer set, block download routing and block advertiser, and mirrors
++//! zebrad's block gossip loop (including the 7 s PEER_GOSSIP_DELAY between broadcasts).
++//! Validation is modelled as a fixed delay before a downloaded block is relayed.
++
++use std::{
++    collections::{HashMap, HashSet},
++    net::{IpAddr, SocketAddr},
++    sync::{Arc, Mutex},
++    task::{Context, Poll},
++    time::{Duration, SystemTime, UNIX_EPOCH},
++};
++
++use futures::{future::BoxFuture, FutureExt};
++use tokio::sync::{mpsc, watch};
++use tower::{Service, ServiceExt};
++use zebra_chain::{
++    block::{self, Block},
++    chain_tip::NoChainTip,
++    parameters::Network,
++    serialization::ZcashDeserialize,
++};
++use zebra_network::{
++    testbed::{self, TestbedConfig},
++    BoxError, CacheDir, InventoryResponse, PeerSocketAddr, Request, Response,
++};
++
++
++struct Args {
++    id: usize,
++    ip: IpAddr,
++    port: u16,
++    peers: Vec<String>,
++    up: f64,
++    down: f64,
++    mode: String,
++    schedule: Option<String>,
++    log: String,
++    seed: u64,
++    validate_ms: u64,
++    target: usize,
++    lat_min: f64,
++    lat_max: f64,
++    duration_s: u64,
++    gossip_delay_ms: u64,
++    dl_timeout_s: u64,
++    time_scale: f64,
++    estimates: Option<String>,
++}
++
++fn parse_args() -> Args {
++    let mut m: HashMap<String, String> = HashMap::new();
++    let argv: Vec<String> = std::env::args().skip(1).collect();
++    for pair in argv.chunks(2) {
++        m.insert(
++            pair[0].trim_start_matches("--").to_string(),
++            pair.get(1).cloned().unwrap_or_default(),
++        );
++    }
++    let get = |k: &str| m.get(k).cloned().unwrap_or_else(|| panic!("missing --{k}"));
++    let opt = |k: &str, d: &str| m.get(k).cloned().unwrap_or_else(|| d.to_string());
++    Args {
++        id: get("id").parse().expect("id"),
++        ip: get("ip").parse().expect("ip"),
++        port: opt("port", "18344").parse().expect("port"),
++        peers: opt("peers", "")
++            .split(',')
++            .filter(|s| !s.is_empty())
++            .map(String::from)
++            .collect(),
++        up: get("up").parse().expect("up"),
++        down: get("down").parse().expect("down"),
++        mode: opt("mode", "zebra"),
++        schedule: m.get("schedule").cloned(),
++        log: get("log"),
++        seed: opt("seed", "1").parse().expect("seed"),
++        validate_ms: opt("validate-ms", "50").parse().expect("validate-ms"),
++        target: opt("target", "8").parse().expect("target"),
++        lat_min: opt("lat-min", "20").parse().expect("lat-min"),
++        lat_max: opt("lat-max", "150").parse().expect("lat-max"),
++        duration_s: opt("duration-s", "600").parse().expect("duration-s"),
++        gossip_delay_ms: opt("gossip-delay-ms", "7000").parse().expect("gossip-delay-ms"),
++        dl_timeout_s: opt("dl-timeout-s", "40").parse().expect("dl-timeout-s"),
++        time_scale: opt("time-scale", "1").parse().expect("time-scale"),
++        estimates: m.get("estimates").cloned(),
++    }
++}
++
++fn now_ms() -> u128 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .expect("clock is after the epoch")
++        .as_millis()
++}
++
++// ---------------------------------------------------------------------------------------------
++// Synthetic full blocks
++
++fn compact(out: &mut Vec<u8>, n: u64) {
++    if n < 0xfd {
++        out.push(n as u8);
++    } else if n <= 0xffff {
++        out.push(0xfd);
++        out.extend_from_slice(&(n as u16).to_le_bytes());
++    } else {
++        out.push(0xfe);
++        out.extend_from_slice(&(n as u32).to_le_bytes());
++    }
++}
++
++struct Rng(u64);
++impl Rng {
++    fn next(&mut self) -> u64 {
++        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
++        let mut z = self.0;
++        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
++        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
++        z ^ (z >> 31)
++    }
++    fn fill(&mut self, out: &mut Vec<u8>, n: usize) {
++        for _ in 0..n {
++            out.push(self.next() as u8);
++        }
++    }
++}
++
++/// Builds a full-size (about 1.95 MB) block of transparent v4 transactions.
++fn build_block(seed: u64, target_bytes: usize) -> Arc<Block> {
++    let mut rng = Rng(seed);
++    let mut txs: Vec<Vec<u8>> = Vec::new();
++    let mut total = 1487 + 5;
++    while total < target_bytes {
++        let mut tx = Vec::with_capacity(10_000);
++        tx.extend_from_slice(&0x8000_0004u32.to_le_bytes()); // overwintered, v4
++        tx.extend_from_slice(&0x892F_2085u32.to_le_bytes()); // sapling version group id
++        compact(&mut tx, 1); // one input
++        rng.fill(&mut tx, 32); // prevout txid
++        tx.extend_from_slice(&0u32.to_le_bytes());
++        compact(&mut tx, 107);
++        rng.fill(&mut tx, 107); // signature + pubkey sized script
++        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
++        // Two outputs with large scripts: realistic bytes on the wire, with few objects to
++        // parse, so 150 nodes sharing one machine's CPU don't distort timing.
++        compact(&mut tx, 2);
++        for _ in 0..2 {
++            tx.extend_from_slice(&1000i64.to_le_bytes());
++            compact(&mut tx, 4800);
++            rng.fill(&mut tx, 4800);
++        }
++        tx.extend_from_slice(&0u32.to_le_bytes()); // lock time
++        tx.extend_from_slice(&0u32.to_le_bytes()); // expiry height
++        tx.extend_from_slice(&0i64.to_le_bytes()); // sapling value balance
++        compact(&mut tx, 0); // spends
++        compact(&mut tx, 0); // outputs
++        compact(&mut tx, 0); // joinsplits
++        total += tx.len();
++        txs.push(tx);
++    }
++    let mut b = Vec::with_capacity(total + 16);
++    b.extend_from_slice(&4u32.to_le_bytes()); // version
++    rng.fill(&mut b, 32 * 3); // previous hash, merkle root, commitments
++    b.extend_from_slice(&(now_ms() as u64 / 1000).to_le_bytes()[..4]);
++    b.extend_from_slice(&0x1f07_ffffu32.to_le_bytes()); // difficulty bits
++    rng.fill(&mut b, 32); // nonce
++    compact(&mut b, 1344);
++    rng.fill(&mut b, 1344); // equihash solution (not checked by this relay)
++    compact(&mut b, txs.len() as u64);
++    for tx in &txs {
++        b.extend_from_slice(tx);
++    }
++    Arc::new(Block::zcash_deserialize(&b[..]).expect("synthetic block is well-formed"))
++}
++
++// ---------------------------------------------------------------------------------------------
++// Inbound service
++
++#[derive(Clone)]
++struct Inbound {
++    blocks: Arc<Mutex<HashMap<block::Hash, Arc<Block>>>>,
++    downloads: mpsc::UnboundedSender<(block::Hash, Option<PeerSocketAddr>)>,
++}
++
++impl Service<Request> for Inbound {
++    type Response = Response;
++    type Error = BoxError;
++    type Future = BoxFuture<'static, Result<Response, BoxError>>;
++
++    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), BoxError>> {
++        Poll::Ready(Ok(()))
++    }
++
++    fn call(&mut self, req: Request) -> Self::Future {
++        let rsp = match req {
++            Request::AdvertiseBlock(hash, advertiser) => {
++                let _ = self.downloads.send((hash, advertiser));
++                Response::Nil
++            }
++            Request::BlocksByHash(hashes) => {
++                let blocks = self.blocks.lock().expect("lock is not poisoned");
++                Response::Blocks(
++                    hashes
++                        .into_iter()
++                        .map(|h| match blocks.get(&h) {
++                            Some(b) => InventoryResponse::Available((b.clone(), None)),
++                            None => InventoryResponse::Missing(h),
++                        })
++                        .collect(),
++                )
++            }
++            Request::Peers => Response::Peers(Vec::new()),
++            Request::MempoolTransactionIds => Response::TransactionIds(Vec::new()),
++            _ => Response::Nil,
++        };
++        async move { Ok(rsp) }.boxed()
++    }
++}
++
++#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
++async fn main() {
++    let a = parse_args();
++    if std::env::var("RUST_LOG").is_ok() {
++        tracing_subscriber::fmt()
++            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
++            .with_writer(std::io::stderr)
++            .init();
++    }
++    let (priority, all) = match a.mode.as_str() {
++        "zebra" => (false, false),
++        "prio" => (true, true),
++        "prio_third" => (true, false),
++        "all_fair" => (false, true),
++        m => panic!("unknown mode {m}"),
++    };
++    testbed::install(TestbedConfig {
++        own_ip: a.ip,
++        upload_mbps: a.up,
++        download_mbps: a.down,
++        latency_seed: a.seed,
++        latency_min_ms: a.lat_min,
++        latency_max_ms: a.lat_max,
++        priority_upload: priority,
++        advertise_to_all: all,
++        log_path: Some(a.log.clone()),
++        time_scale: a.time_scale,
++    });
++    if let Some(path) = &a.estimates {
++        let text = std::fs::read_to_string(path).expect("estimates file is readable");
++        for line in text.lines() {
++            let f: Vec<&str> = line.split_whitespace().collect();
++            if let [ip, mbps] = f.as_slice() {
++                testbed::seed_peer_rate(ip.parse().expect("ip"), mbps.parse().expect("mbps"));
++            }
++        }
++    }
++    testbed::log_event(&format!(
++        "START id={} ip={} up={} down={} mode={}",
++        a.id, a.ip, a.up, a.down, a.mode
++    ));
++
++    let mut config = zebra_network::Config {
++        network: Network::new_regtest(Default::default()),
++        listen_addr: SocketAddr::new(a.ip, a.port),
++        cache_dir: CacheDir::disabled(),
++        peerset_initial_target_size: a.target.max(1),
++        ..Default::default()
++    };
++    config.initial_testnet_peers = a.peers.iter().cloned().collect();
++
++    let blocks: Arc<Mutex<HashMap<block::Hash, Arc<Block>>>> = Default::default();
++    let (dl_tx, mut dl_rx) = mpsc::unbounded_channel();
++    let inbound = Inbound {
++        blocks: blocks.clone(),
++        downloads: dl_tx,
++    };
++    let (peer_set, address_book, _misbehavior, mut advertiser) = zebra_network::init(
++        config,
++        inbound,
++        NoChainTip,
++        format!("/zebra-relay:{}/", a.id),
++    )
++    .await;
++
++    let (tip_tx, mut tip_rx) = watch::channel(None::<block::Hash>);
++    let (mined_tx, mut mined_rx) = mpsc::unbounded_channel::<block::Hash>();
++
++    // Gossiped block downloader: one in-flight download per hash, like zebrad's inbound downloads.
++    {
++        let blocks = blocks.clone();
++        let validate = Duration::from_millis(a.validate_ms);
++        let dl_timeout = Duration::from_secs(a.dl_timeout_s);
++        tokio::spawn(async move {
++            let inflight: Arc<Mutex<HashSet<block::Hash>>> = Default::default();
++            while let Some((hash, advertiser)) = dl_rx.recv().await {
++                if blocks.lock().expect("lock").contains_key(&hash)
++                    || !inflight.lock().expect("lock").insert(hash)
++                {
++                    continue;
++                }
++                let adv = advertiser.map(|x| x.to_string()).unwrap_or_default();
++                testbed::log_event(&format!("INV {hash} {adv}"));
++                let peer_set = peer_set.clone();
++                let blocks = blocks.clone();
++                let inflight = inflight.clone();
++                let tip_tx = tip_tx.clone();
++                tokio::spawn(async move {
++                    let res = tokio::time::timeout(
++                        dl_timeout,
++                        peer_set.oneshot(Request::BlockDownload { hash, advertiser }),
++                    )
++                    .await;
++                    match res {
++                        Ok(Ok(Response::Blocks(mut v))) if !v.is_empty() => {
++                            if let InventoryResponse::Available((block, from)) = v.remove(0) {
++                                let from = from.map(|x| x.to_string()).unwrap_or_default();
++                                testbed::log_event(&format!("RECV {hash} {from}"));
++                                tokio::time::sleep(validate).await;
++                                {
++                                    // Keep memory flat: only recent blocks are ever requested.
++                                    let mut b = blocks.lock().expect("lock");
++                                    if b.len() >= 4 {
++                                        b.clear();
++                                    }
++                                    b.insert(hash, block);
++                                }
++                                testbed::log_event(&format!("VALID {hash}"));
++                                let _ = tip_tx.send(Some(hash));
++                            } else {
++                                testbed::log_event(&format!("DLFAIL {hash} notfound"));
++                            }
++                        }
++                        other => {
++                            let why = match other {
++                                Ok(Ok(_)) => "unexpected response".to_string(),
++                                Ok(Err(e)) => e.to_string(),
++                                Err(_) => "timeout".to_string(),
++                            };
++                            testbed::log_event(&format!(
++                                "DLFAIL {hash} {}",
++                                why.replace(' ', "_")
++                            ));
++                        }
++                    }
++                    inflight.lock().expect("lock").remove(&hash);
++                });
++            }
++        });
++    }
++
++    // Block gossip, mirroring zebrad's gossip_best_tip_block_hashes loop.
++    let gossip_delay = Duration::from_millis(a.gossip_delay_ms);
++    tokio::spawn(async move {
++        loop {
++            let tip_change = async {
++                tokio::time::sleep(gossip_delay).await;
++                loop {
++                    if tip_rx.changed().await.is_err() {
++                        futures::future::pending::<()>().await;
++                    }
++                    if let Some(h) = *tip_rx.borrow_and_update() {
++                        return h;
++                    }
++                }
++            };
++            let (hash, mined) = tokio::select! {
++                h = tip_change => (h, false),
++                Some(h) = mined_rx.recv() => (h, true),
++            };
++            let req = if mined {
++                Request::AdvertiseBlockToAll(hash)
++            } else {
++                Request::AdvertiseBlock(hash, None)
++            };
++            match advertiser.ready().await {
++                Ok(svc) => {
++                    testbed::log_event(&format!("ADV {hash} mined={mined}"));
++                    let fut = svc.call(req);
++                    tokio::spawn(async move {
++                        if let Err(e) = fut.await {
++                            testbed::log_event(&format!(
++                                "ADVFAIL {hash} {}",
++                                e.to_string().replace(' ', "_")
++                            ));
++                        }
++                    });
++                }
++                Err(e) => testbed::log_event(&format!("ADVNOTREADY {e}")),
++            }
++        }
++    });
++
++    // Mining schedule: lines of "<unix_ms> <node_id> <seed>".
++    if let Some(path) = &a.schedule {
++        let text = std::fs::read_to_string(path).expect("schedule is readable");
++        for line in text.lines() {
++            let f: Vec<&str> = line.split_whitespace().collect();
++            if f.len() < 3 || f[1].parse::<usize>().ok() != Some(a.id) {
++                continue;
++            }
++            let at: u128 = f[0].parse().expect("time");
++            let seed: u64 = f[2].parse().expect("seed");
++            let blocks = blocks.clone();
++            let mined_tx = mined_tx.clone();
++            tokio::spawn(async move {
++                // Build the block a moment early so construction time isn't counted.
++                let lead = 1500u128;
++                let wait = at.saturating_sub(now_ms() + lead);
++                tokio::time::sleep(Duration::from_millis(wait as u64)).await;
++                let block = tokio::task::spawn_blocking(move || build_block(seed, 1_950_000))
++                    .await
++                    .expect("block builder does not panic");
++                let wait = at.saturating_sub(now_ms());
++                tokio::time::sleep(Duration::from_millis(wait as u64)).await;
++                let hash = block.hash();
++                blocks.lock().expect("lock").insert(hash, block);
++                testbed::log_event(&format!("MINED {hash}"));
++                let _ = mined_tx.send(hash);
++            });
++        }
++    }
++
++    // Periodically record connected peers and rate estimates.
++    let address_metrics = address_book
++        .lock()
++        .expect("lock is not poisoned")
++        .address_metrics_watcher();
++    tokio::spawn(async move {
++        loop {
++            tokio::time::sleep(Duration::from_secs(10)).await;
++            let est: Vec<String> = testbed::peer_rate_estimates()
++                .into_iter()
++                .map(|(ip, r)| format!("{ip}={r:.0}"))
++                .collect();
++            let responded = address_metrics.borrow().responded;
++            testbed::log_event(&format!("PEERS {responded}"));
++            testbed::log_event(&format!("ESTIMATES {}", est.join(",")));
++        }
++    });
++
++    // Event-loop lag monitor: how late a 100 ms timer fires. Large lag means the machine,
++    // not the emulated network, is the bottleneck.
++    tokio::spawn(async move {
++        let mut worst = Duration::ZERO;
++        let mut last_report = tokio::time::Instant::now();
++        loop {
++            let t = tokio::time::Instant::now();
++            tokio::time::sleep(Duration::from_millis(100)).await;
++            worst = worst.max(t.elapsed().saturating_sub(Duration::from_millis(100)));
++            if last_report.elapsed() >= Duration::from_secs(5) {
++                testbed::log_event(&format!("LAG {}", worst.as_millis()));
++                worst = Duration::ZERO;
++                last_report = tokio::time::Instant::now();
++            }
++        }
++    });
++
++    tokio::time::sleep(Duration::from_secs(a.duration_s)).await;
++    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
++    let f: Vec<&str> = stat.rsplit(')').next().unwrap_or("").split_whitespace().collect();
++    let ticks = |i: usize| f.get(i).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0) / 100.0;
++    testbed::log_event(&format!("CPU {:.2} {:.2}", ticks(11), ticks(12)));
++    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
++    if let Some(l) = status.lines().find(|l| l.starts_with("VmHWM")) {
++        testbed::log_event(&format!("MEM {}", l.split_whitespace().nth(1).unwrap_or("0")));
++    }
++    testbed::log_event("STOP");
++    std::process::exit(0);
++}
+-- 
+2.43.0
+

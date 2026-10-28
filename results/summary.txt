@@ -1,0 +1,8 @@
+dc     att=0  prio_warm   blocks=6   p50=0.91 p90=1.78 minerP50=0.96 stale=4.1% (4.0, 4.2) cover=1.000 lag99=30 fails=0
+dc     att=0  zebra       blocks=6   p50=1.57 p90=1.70 minerP50=1.63 stale=5.9% (5.2, 6.6) cover=1.000 lag99=59 fails=0
+mixed  att=0  prio        blocks=12  p50=1.58 p90=3.53 minerP50=1.97 stale=7.7% (6.9, 8.4) cover=1.000 lag99=37 fails=0
+mixed  att=0  prio_third  blocks=6   p50=1.43 p90=3.22 minerP50=1.78 stale=7.0% (6.2, 7.9) cover=1.000 lag99=49 fails=0
+mixed  att=0  prio_warm   blocks=18  p50=1.30 p90=3.38 minerP50=0.82 stale=3.6% (3.2, 3.9) cover=1.000 lag99=106 fails=0
+mixed  att=0  zebra       blocks=18  p50=2.66 p90=3.35 minerP50=2.67 stale=10.0% (8.9, 11.3) cover=0.998 lag99=103 fails=4
+mixed  att=10 prio_warm   blocks=6   p50=1.41 p90=3.44 minerP50=1.00 stale=4.2% (3.8, 4.5) cover=1.000 lag99=47 fails=7
+mixed  att=10 zebra       blocks=6   p50=2.21 p90=2.62 minerP50=2.22 stale=8.4% (7.1, 10.2) cover=1.000 lag99=26 fails=5

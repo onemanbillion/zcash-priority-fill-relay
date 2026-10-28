@@ -1,0 +1,5419 @@
+From 031aa398883c06c9761261f5bcfe4df0411d873b Mon Sep 17 00:00:00 2001
+From: testbed <hello@paul.church>
+Date: Wed, 28 Oct 2026 12:40:28 -0500
+Subject: [PATCH 2/3] fix(network): gate the testbed behind a feature and fix
+ its security and correctness issues
+
+- Put link emulation, the upload scheduler and the testbed constants behind an
+  off-by-default `testbed` feature; normal builds use plain TcpStream and the
+  original timeouts, inbound interval and localhost check.
+- Keep zebra-relay out of the workspace so the feature never unifies into zebrad.
+- Close a connection's socket when its stream is dropped, bound user-space
+  buffering to the emulated link, and forward socket read errors.
+- Scheduler: serve waits over 500 ms first, cap gate waits at 2 s, serve repeated
+  requests last, measure only replies to our own block requests, release slots via
+  RAII, reject non-finite estimates, and bound and expire the estimate map.
+- Relay: limit in-flight downloads (200, one per advertiser IP), keep a bounded
+  block store, cap the event log, and refuse non-loopback addresses.
+- Add regression tests for each fix.
+---
+ .../zebra-network-Added-20261028-123000.yaml  |    4 +
+ Cargo.lock                                    |   12 -
+ Cargo.toml                                    |    5 +-
+ zebra-network/Cargo.toml                      |    7 +-
+ zebra-network/src/constants.rs                |   17 +-
+ zebra-network/src/lib.rs                      |    2 +
+ zebra-network/src/meta_addr/peer_addr.rs      |   10 +-
+ zebra-network/src/peer/connection.rs          |   27 +-
+ zebra-network/src/peer/connector.rs           |    5 +-
+ zebra-network/src/peer_set.rs                 |    4 +-
+ zebra-network/src/peer_set/initialize.rs      |   20 +-
+ .../src/peer_set/initialize/tests/vectors.rs  |   19 +-
+ zebra-network/src/peer_stream.rs              |   52 +
+ zebra-network/src/testbed.rs                  |  516 ++-
+ zebra-network/src/testbed/tests.rs            |  314 +-
+ zebra-relay/Cargo.lock                        | 3343 +++++++++++++++++
+ zebra-relay/Cargo.toml                        |   18 +-
+ zebra-relay/src/main.rs                       |  131 +-
+ 18 files changed, 4228 insertions(+), 278 deletions(-)
+ create mode 100644 .changes/unreleased/zebra-network-Added-20261028-123000.yaml
+ create mode 100644 zebra-network/src/peer_stream.rs
+ create mode 100644 zebra-relay/Cargo.lock
+
+diff --git a/.changes/unreleased/zebra-network-Added-20261028-123000.yaml b/.changes/unreleased/zebra-network-Added-20261028-123000.yaml
+new file mode 100644
+index 0000000..54b2c99
+--- /dev/null
++++ b/.changes/unreleased/zebra-network-Added-20261028-123000.yaml
+@@ -0,0 +1,4 @@
++project: zebra-network
++kind: Added
++body: 'Added an off-by-default `testbed` feature with link emulation and an experimental priority-fill block upload scheduler, for running many local nodes in relay experiments. It changes peer transport and timeouts, so it must never be enabled in a node that connects to Mainnet or Testnet.'
++time: 2026-10-28T12:30:00.000000-05:00
+diff --git a/Cargo.lock b/Cargo.lock
+index d3ee00f..09edf00 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -7505,18 +7505,6 @@ dependencies = [
+  "zebra-chain",
+ ]
+ 
+-[[package]]
+-name = "zebra-relay"
+-version = "0.1.0"
+-dependencies = [
+- "futures",
+- "tokio",
+- "tower 0.4.13",
+- "tracing-subscriber",
+- "zebra-chain",
+- "zebra-network",
+-]
+-
+ [[package]]
+ name = "zebra-rpc"
+ version = "19.0.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index 8329338..5fd6300 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -12,8 +12,10 @@ members = [
+         "zebra-utils",
+         "tower-batch-control",
+         "tower-fallback",
+-        "zebra-relay",
+ ]
++# The testbed relay enables zebra-network's `testbed` feature, so it is kept out of the
++# workspace: workspace builds must never unify that feature into zebrad.
++exclude = ["zebra-relay"]
+ 
+ # Use the edition 2021 dependency resolver in the workspace, to match the crates
+ resolver = "2"
+@@ -138,6 +140,7 @@ serde_json = "1.0.140"
+ serde_with = "3.12"
+ serde_yml = "0.0"
+ sha2 = "0.10"
++socket2 = "0.6"
+ sinsemilla = "0.2"
+ schemars = "1"
+ spandoc = "0.2"
+diff --git a/zebra-network/Cargo.toml b/zebra-network/Cargo.toml
+index 56b48c0..4a00749 100644
+--- a/zebra-network/Cargo.toml
++++ b/zebra-network/Cargo.toml
+@@ -43,11 +43,16 @@ proptest-impl = ["proptest", "proptest-derive", "zebra-chain/proptest-impl"]
+ # Exposes `protocol` to fuzz harnesses; private in normal builds.
+ fuzzing = []
+ 
++# Testbed-only link emulation and experimental block upload scheduling, for running many
++# nodes on one machine. Changes peer transport and timing constants: never enable it in a
++# node that connects to Mainnet or Testnet.
++testbed = ["dep:socket2"]
++
+ [dependencies]
+ bitflags = { workspace = true }
+ byteorder = { workspace = true }
+ bytes = { workspace = true }
+-socket2 = "0.6"
++socket2 = { workspace = true, optional = true }
+ chrono = { workspace = true, features = ["clock", "std"] }
+ dirs = { workspace = true }
+ hex = { workspace = true }
+diff --git a/zebra-network/src/constants.rs b/zebra-network/src/constants.rs
+index f9a63b4..7ea5f3c 100644
+--- a/zebra-network/src/constants.rs
++++ b/zebra-network/src/constants.rs
+@@ -103,7 +103,14 @@ pub const PEERSET_BUFFER_SIZE: usize = 3;
+ 
+ /// The timeout for sending a message to a remote peer,
+ /// and receiving a response from a remote peer.
+-// Testbed: 20 s scaled by the experiments' time dilation factor (4).
++#[cfg(not(feature = "testbed"))]
++pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
++
++/// The timeout for sending a message to a remote peer,
++/// and receiving a response from a remote peer.
++///
++/// Testbed builds scale it by the experiments' 4x time dilation.
++#[cfg(feature = "testbed")]
+ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20 * 4);
+ 
+ /// The timeout for connections and handshakes when connecting to new peers.
+@@ -146,8 +153,14 @@ pub const CONCURRENT_ADDRESS_CHANGE_PERIOD: Duration = Duration::from_secs(5);
+ /// This avoids explicit synchronization, but relies on the peer
+ /// connector actually setting up channels and these heartbeats in a
+ /// specific manner that matches up with this math.
++#[cfg(not(feature = "testbed"))]
+ pub const MIN_PEER_RECONNECTION_DELAY: Duration = Duration::from_secs(59 + 20 + 20 + 20);
+ 
++/// The minimum time between connections to the same peer, in testbed builds,
++/// where [`REQUEST_TIMEOUT`] is scaled by the experiments' time dilation.
++#[cfg(feature = "testbed")]
++pub const MIN_PEER_RECONNECTION_DELAY: Duration = Duration::from_secs(59 + 80 + 80 + 80);
++
+ /// Zebra rotates its peer inventory registry every time this interval elapses.
+ ///
+ /// Available, missing, and failed inventory entries expire after two rotations. Delayed polling
+@@ -251,7 +264,7 @@ pub const MIN_OUTBOUND_PEER_CONNECTION_INTERVAL: Duration = Duration::from_milli
+ ///
+ /// The inbound interval is much longer than the outbound interval, because Zebra does not
+ /// control the selection or reconnections of inbound peers.
+-pub const MIN_INBOUND_PEER_CONNECTION_INTERVAL: Duration = Duration::from_millis(20);
++pub const MIN_INBOUND_PEER_CONNECTION_INTERVAL: Duration = Duration::from_secs(1);
+ 
+ /// The minimum time between _failed_ inbound peer connections, implemented by
+ /// `peer_set::initialize::accept_inbound_connections`.
+diff --git a/zebra-network/src/lib.rs b/zebra-network/src/lib.rs
+index aa0b83f..35bff87 100644
+--- a/zebra-network/src/lib.rs
++++ b/zebra-network/src/lib.rs
+@@ -152,6 +152,7 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+ pub mod address_book_peers;
+ pub mod config;
+ pub mod constants;
++#[cfg(feature = "testbed")]
+ pub mod testbed;
+ 
+ mod address_book;
+@@ -163,6 +164,7 @@ mod meta_addr;
+ mod peer;
+ mod peer_cache_updater;
+ mod peer_set;
++mod peer_stream;
+ mod policies;
+ // Fuzzing switch: expose `protocol::external` (Codec/Message) to the p2p fuzz
+ // harnesses. Private in normal builds; public only under `fuzzing`.
+diff --git a/zebra-network/src/meta_addr/peer_addr.rs b/zebra-network/src/meta_addr/peer_addr.rs
+index 77e9a28..99fb735 100644
+--- a/zebra-network/src/meta_addr/peer_addr.rs
++++ b/zebra-network/src/meta_addr/peer_addr.rs
+@@ -3,7 +3,7 @@
+ 
+ use std::{
+     fmt,
+-    net::{Ipv4Addr, SocketAddr},
++    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+     ops::{Deref, DerefMut},
+     str::FromStr,
+ };
+@@ -79,8 +79,14 @@ impl PeerSocketAddr {
+     }
+ 
+     /// Returns true if the inner [`SocketAddr`]'s IP is the localhost IP.
++    ///
++    /// Testbed builds accept any loopback address (all of `127.0.0.0/8`), so many local nodes
++    /// can each have their own IP.
+     pub fn is_localhost(&self) -> bool {
+         let ip = self.0.ip();
+-        ip.is_loopback()
++        if cfg!(feature = "testbed") {
++            return ip.is_loopback();
++        }
++        ip == Ipv4Addr::LOCALHOST || ip == Ipv6Addr::LOCALHOST
+     }
+ }
+diff --git a/zebra-network/src/peer/connection.rs b/zebra-network/src/peer/connection.rs
+index c6cb52e..79a62a7 100644
+--- a/zebra-network/src/peer/connection.rs
++++ b/zebra-network/src/peer/connection.rs
+@@ -1148,15 +1148,23 @@ where
+                     .map(|()| Handler::Ping { nonce, ping_sent_at })
+             }
+ 
+-            (AwaitingRequest, BlockDownload { hash, .. }) => self
++            (AwaitingRequest, BlockDownload { hash, .. }) => {
++                #[cfg(feature = "testbed")]
++                self.testbed_expect_blocks(1);
++
++                self
+                 .peer_tx
+                 .send(Message::GetData(vec![hash.into()]))
+                 .await
+                 .map(|()| Handler::BlocksByHash {
+                     blocks: Vec::with_capacity(1),
+                     pending_hashes: HashSet::from([hash]),
+-                }),
++                })
++            }
+             (AwaitingRequest, BlocksByHash(hashes)) => {
++                #[cfg(feature = "testbed")]
++                self.testbed_expect_blocks(hashes.len());
++
+                 self
+                     .peer_tx
+                     .send(Message::GetData(
+@@ -1607,11 +1615,17 @@ where
+             }
+             Response::Blocks(blocks) => {
+                 // Testbed: wait for this node's upload scheduler, and hold the guard while writing.
++                #[cfg(feature = "testbed")]
+                 let _serve = crate::testbed::serve_blocks(
+                     self.connection_info
+                         .connected_addr
+                         .get_transient_addr()
+                         .map(|addr| addr.ip()),
++                    blocks
++                        .iter()
++                        .filter_map(|block| block.available())
++                        .map(|(block, _)| block.hash())
++                        .collect(),
+                 )
+                 .await;
+ 
+@@ -1791,6 +1805,15 @@ impl<S, Tx, C> Connection<S, Tx, C>
+ where
+     Tx: Sink<Message, Error = SerializationError> + Unpin,
+ {
++    /// Testbed: tells the throughput tracker that this peer now owes us `count` blocks,
++    /// so only the replies to our own block requests count as throughput samples.
++    #[cfg(feature = "testbed")]
++    fn testbed_expect_blocks(&self, count: usize) {
++        if let Some(addr) = self.connection_info.connected_addr.get_transient_addr() {
++            crate::testbed::expect_block_replies(addr.ip(), count);
++        }
++    }
++
+     /// Update the connection state metrics for this connection,
+     /// using `extra_state_info` as additional state information.
+     ///
+diff --git a/zebra-network/src/peer/connector.rs b/zebra-network/src/peer/connector.rs
+index 43f3afb..e9032cd 100644
+--- a/zebra-network/src/peer/connector.rs
++++ b/zebra-network/src/peer/connector.rs
+@@ -95,10 +95,9 @@ where
+         // `zebra_network::init()` implements a connection timeout on this future.
+         // Any code outside this future does not have a timeout.
+         async move {
+-            let tcp_stream = crate::testbed::connect(*addr).await?;
+-            let tcp_stream = crate::testbed::wrap(tcp_stream, *addr);
++            let tcp_stream = crate::peer_stream::connect(*addr).await?;
+             let client = hs
+-                .oneshot(HandshakeRequest::<crate::testbed::ShapedStream> {
++                .oneshot(HandshakeRequest::<crate::peer_stream::PeerStream> {
+                     data_stream: tcp_stream,
+                     connected_addr,
+                     connection_tracker,
+diff --git a/zebra-network/src/peer_set.rs b/zebra-network/src/peer_set.rs
+index c829406..6ab4f17 100644
+--- a/zebra-network/src/peer_set.rs
++++ b/zebra-network/src/peer_set.rs
+@@ -213,5 +213,7 @@ fn broadcast_peer_count(network: &Network, peers: usize) -> usize {
+     } else {
+         peers.div_ceil(3)
+     };
+-    crate::testbed::broadcast_peer_count(peers, default)
++    #[cfg(feature = "testbed")]
++    let default = crate::testbed::broadcast_peer_count(peers, default);
++    default
+ }
+diff --git a/zebra-network/src/peer_set/initialize.rs b/zebra-network/src/peer_set/initialize.rs
+index 83a3258..0b95a77 100644
+--- a/zebra-network/src/peer_set/initialize.rs
++++ b/zebra-network/src/peer_set/initialize.rs
+@@ -272,7 +272,9 @@ where
+     let listen_fut = accept_inbound_connections(
+         config.clone(),
+         tcp_listener,
+-        constants::MIN_INBOUND_PEER_CONNECTION_INTERVAL,
++        crate::peer_stream::inbound_connection_interval(
++            constants::MIN_INBOUND_PEER_CONNECTION_INTERVAL,
++        ),
+         listen_handshaker,
+         peerset_tx.clone(),
+         bans_receiver,
+@@ -717,8 +719,11 @@ async fn accept_inbound_connections<S>(
+     zcashd_compat_peer_ips: Vec<IpAddr>,
+ ) -> Result<(), BoxError>
+ where
+-    S: Service<peer::HandshakeRequest<crate::testbed::ShapedStream>, Response = peer::Client, Error = BoxError>
+-        + Clone,
++    S: Service<
++            peer::HandshakeRequest<crate::peer_stream::PeerStream>,
++            Response = peer::Client,
++            Error = BoxError,
++        > + Clone,
+     S::Future: Send + 'static,
+ {
+     let mut recent_inbound_connections =
+@@ -897,8 +902,11 @@ async fn accept_inbound_handshake<S>(
+     handshakes: &mut JoinSet<()>,
+ ) -> Result<(), BoxError>
+ where
+-    S: Service<peer::HandshakeRequest<crate::testbed::ShapedStream>, Response = peer::Client, Error = BoxError>
+-        + Clone,
++    S: Service<
++            peer::HandshakeRequest<crate::peer_stream::PeerStream>,
++            Response = peer::Client,
++            Error = BoxError,
++        > + Clone,
+     S::Future: Send + 'static,
+ {
+     let connected_addr = peer::ConnectedAddr::new_inbound_direct(addr);
+@@ -914,7 +922,7 @@ where
+     handshaker.ready().await?;
+ 
+     // Construct a handshake future but do not drive it yet....
+-    let tcp_stream = crate::testbed::wrap(tcp_stream, *addr);
++    let tcp_stream = crate::peer_stream::accept(tcp_stream, *addr);
+     let handshake = handshaker.call(HandshakeRequest {
+         data_stream: tcp_stream,
+         connected_addr,
+diff --git a/zebra-network/src/peer_set/initialize/tests/vectors.rs b/zebra-network/src/peer_set/initialize/tests/vectors.rs
+index 3b0108b..3548d1e 100644
+--- a/zebra-network/src/peer_set/initialize/tests/vectors.rs
++++ b/zebra-network/src/peer_set/initialize/tests/vectors.rs
+@@ -53,6 +53,7 @@ use crate::{
+     AddressBook, BoxError, Config, MisbehaviorReport, PeerSocketAddr, Request, Response,
+ };
+ 
++use crate::peer_stream::PeerStream;
+ use Network::*;
+ 
+ /// The amount of time to run the crawler, before testing what it has done.
+@@ -971,7 +972,7 @@ async fn listener_peer_limit_one_handshake_ok_then_drop() {
+     }
+ 
+     let success_disconnect_inbound_handshaker =
+-        service_fn(|req: HandshakeRequest<crate::testbed::ShapedStream>| async move {
++        service_fn(|req: HandshakeRequest<PeerStream>| async move {
+             let HandshakeRequest {
+                 data_stream: tcp_stream,
+                 connected_addr: _,
+@@ -1030,7 +1031,7 @@ async fn listener_peer_limit_one_handshake_ok_stay_open() {
+     let (peer_tracker_tx, mut peer_tracker_rx) = mpsc::unbounded();
+ 
+     let success_stay_open_inbound_handshaker =
+-        service_fn(move |req: HandshakeRequest<crate::testbed::ShapedStream>| {
++        service_fn(move |req: HandshakeRequest<PeerStream>| {
+             let peer_tracker_tx = peer_tracker_tx.clone();
+             async move {
+                 let HandshakeRequest {
+@@ -1113,7 +1114,7 @@ async fn listener_reserves_one_zcashd_compat_inbound_slot() {
+     let (peer_tracker_tx, mut peer_tracker_rx) = mpsc::unbounded();
+ 
+     let success_stay_open_inbound_handshaker =
+-        service_fn(move |req: HandshakeRequest<crate::testbed::ShapedStream>| {
++        service_fn(move |req: HandshakeRequest<PeerStream>| {
+             let peer_tracker_tx = peer_tracker_tx.clone();
+             async move {
+                 let HandshakeRequest {
+@@ -1216,7 +1217,7 @@ async fn listener_zcashd_compat_reconnect_bypasses_recent_ip_limit() {
+ 
+     let zcashd_compat_ip = Ipv4Addr::new(127, 0, 0, 2);
+     let success_disconnect_inbound_handshaker =
+-        service_fn(|req: HandshakeRequest<crate::testbed::ShapedStream>| async move {
++        service_fn(|req: HandshakeRequest<PeerStream>| async move {
+             let HandshakeRequest {
+                 data_stream: tcp_stream,
+                 connected_addr,
+@@ -1355,7 +1356,7 @@ async fn listener_canonicalizes_ipv4_mapped_inbound_addrs() {
+     let (peer_tracker_tx, mut peer_tracker_rx) = mpsc::unbounded();
+ 
+     let success_stay_open_inbound_handshaker =
+-        service_fn(move |req: HandshakeRequest<crate::testbed::ShapedStream>| {
++        service_fn(move |req: HandshakeRequest<PeerStream>| {
+             let peer_tracker_tx = peer_tracker_tx.clone();
+             async move {
+                 let HandshakeRequest {
+@@ -1704,7 +1705,7 @@ async fn listener_peer_limit_default_handshake_ok_then_drop() {
+     }
+ 
+     let success_disconnect_inbound_handshaker =
+-        service_fn(|req: HandshakeRequest<crate::testbed::ShapedStream>| async move {
++        service_fn(|req: HandshakeRequest<PeerStream>| async move {
+             let HandshakeRequest {
+                 data_stream: tcp_stream,
+                 connected_addr: _,
+@@ -1763,7 +1764,7 @@ async fn listener_peer_limit_default_handshake_ok_stay_open() {
+     let (peer_tracker_tx, mut peer_tracker_rx) = mpsc::unbounded();
+ 
+     let success_stay_open_inbound_handshaker =
+-        service_fn(move |req: HandshakeRequest<crate::testbed::ShapedStream>| {
++        service_fn(move |req: HandshakeRequest<PeerStream>| {
+             let peer_tracker_tx = peer_tracker_tx.clone();
+             async move {
+                 let HandshakeRequest {
+@@ -2390,7 +2391,7 @@ async fn connect_from(source_ip: Ipv4Addr, listen_addr: SocketAddr) -> TcpStream
+ 
+ /// Drains the accepted inbound peer tracker channel, returning the accepted peer IPs.
+ fn drain_accepted_inbound_ips(
+-    peer_tracker_rx: &mut mpsc::UnboundedReceiver<(IpAddr, crate::testbed::ShapedStream, ConnectionTracker)>,
++    peer_tracker_rx: &mut mpsc::UnboundedReceiver<(IpAddr, PeerStream, ConnectionTracker)>,
+ ) -> Vec<Ipv4Addr> {
+     let mut accepted_ips = Vec::new();
+ 
+@@ -2439,7 +2440,7 @@ async fn spawn_inbound_listener_with_peer_limit<S>(
+     listen_handshaker: S,
+ ) -> (Config, mpsc::Receiver<DiscoveredPeer>)
+ where
+-    S: Service<peer::HandshakeRequest<crate::testbed::ShapedStream>, Response = peer::Client, Error = BoxError>
++    S: Service<peer::HandshakeRequest<PeerStream>, Response = peer::Client, Error = BoxError>
+         + Clone
+         + Send
+         + Sync
+diff --git a/zebra-network/src/peer_stream.rs b/zebra-network/src/peer_stream.rs
+new file mode 100644
+index 0000000..7d24849
+--- /dev/null
++++ b/zebra-network/src/peer_stream.rs
+@@ -0,0 +1,52 @@
++//! The transport used for peer connections.
++//!
++//! Normal builds use plain TCP. Builds with the `testbed` feature wrap each connection in the
++//! testbed's link emulation.
++
++use std::{io, net::SocketAddr, time::Duration};
++
++use tokio::net::TcpStream;
++
++/// The transport type of a peer connection.
++#[cfg(not(feature = "testbed"))]
++pub(crate) type PeerStream = TcpStream;
++
++/// The transport type of a peer connection.
++#[cfg(feature = "testbed")]
++pub(crate) type PeerStream = crate::testbed::ShapedStream;
++
++/// Opens an outbound peer connection to `addr`.
++pub(crate) async fn connect(addr: SocketAddr) -> io::Result<PeerStream> {
++    #[cfg(not(feature = "testbed"))]
++    return TcpStream::connect(addr).await;
++
++    #[cfg(feature = "testbed")]
++    {
++        let stream = crate::testbed::connect(addr).await?;
++        Ok(crate::testbed::wrap(stream, addr))
++    }
++}
++
++/// Turns an accepted inbound socket from `addr` into a peer transport.
++pub(crate) fn accept(stream: TcpStream, addr: SocketAddr) -> PeerStream {
++    #[cfg(not(feature = "testbed"))]
++    {
++        let _ = addr;
++        stream
++    }
++
++    #[cfg(feature = "testbed")]
++    crate::testbed::wrap(stream, addr)
++}
++
++/// The minimum interval between accepted inbound connections.
++///
++/// Testbed builds shorten it while the testbed is installed, so that many local nodes can
++/// connect to each other at startup. Overload protection keeps using the normal constant.
++pub(crate) fn inbound_connection_interval(default: Duration) -> Duration {
++    #[cfg(feature = "testbed")]
++    return crate::testbed::inbound_connection_interval(default);
++
++    #[cfg(not(feature = "testbed"))]
++    default
++}
+diff --git a/zebra-network/src/testbed.rs b/zebra-network/src/testbed.rs
+index b15e401..b441eb5 100644
+--- a/zebra-network/src/testbed.rs
++++ b/zebra-network/src/testbed.rs
+@@ -1,4 +1,6 @@
+-//! Testbed-only instrumentation for block relay experiments. Not for production use.
++//! Testbed-only instrumentation for block relay experiments, behind the `testbed` feature.
++//!
++//! Never enable this feature in a node that connects to Mainnet or Testnet.
+ //!
+ //! When [`install`] is called, every peer TCP connection is wrapped in a [`ShapedStream`]:
+ //! - this node's total upload and download are limited by shared token buckets,
+@@ -7,9 +9,11 @@
+ //!
+ //! It also provides the experimental "priority fill" upload scheduler for block responses,
+ //! and the block advert fanout switch (one third of peers, like Mainnet, or all peers).
++//!
++//! Without [`install`], wrapped connections pass bytes straight through.
+ 
+ use std::{
+-    collections::{HashMap, VecDeque},
++    collections::{HashMap, HashSet, VecDeque},
+     future::Future,
+     io::{self, Write},
+     net::{IpAddr, SocketAddr},
+@@ -30,13 +34,19 @@ use tokio::{
+         TcpSocket, TcpStream,
+     },
+     sync::{mpsc, oneshot},
++    task::JoinHandle,
+     time::{Instant, Sleep},
+ };
++use zebra_chain::block;
+ 
+ /// Maximum bytes moved per read or write call.
+ const CHUNK: usize = 16 * 1024;
+ /// Kernel socket buffer size, small so backpressure reaches the sender quickly.
+ const SOCK_BUF: usize = 32 * 1024;
++/// Chunks a connection may buffer when the testbed is not installed (pass-through mode).
++const PASSTHROUGH_CHUNKS: usize = 2;
++/// Most chunks any connection may buffer, whatever its emulated latency.
++const MAX_CHUNKS: usize = 1024;
+ /// Bytes of a contiguous receive burst needed before it counts as a throughput sample.
+ const MIN_SAMPLE_BYTES: u64 = 256 * 1024;
+ /// A pause longer than this ends a receive burst.
+@@ -47,6 +57,22 @@ const ADMIT_UTILIZATION: f64 = 0.85;
+ const RAMP: Duration = Duration::from_millis(50);
+ /// Window used to measure upload utilization.
+ const UTIL_WINDOW: Duration = Duration::from_millis(100);
++/// A request waiting longer than this is served before any higher-ranked request.
++const MAX_FAIR_WAIT: Duration = Duration::from_millis(500);
++/// A request waiting longer than this is served without waiting for a free slot.
++const MAX_GATE_WAIT: Duration = Duration::from_secs(2);
++/// Throughput estimates older than this are forgotten.
++const ESTIMATE_TTL: Duration = Duration::from_secs(3600);
++/// Most peers with a stored throughput estimate.
++const MAX_ESTIMATES: usize = 4096;
++/// Most outstanding block replies counted for one peer.
++const MAX_EXPECTED_REPLIES: u32 = 16;
++/// Most (peer, block) pairs remembered to detect repeated requests.
++const MAX_SERVED: usize = 8192;
++/// The event log stops growing at this size.
++const LOG_CAP_BYTES: u64 = 512 * 1024 * 1024;
++/// Default estimate when no peer has been measured yet: 50 Mb/s in bytes per second.
++const DEFAULT_RATE: f64 = 50e6 / 8.0;
+ 
+ /// Testbed settings for this node.
+ #[derive(Clone, Debug)]
+@@ -77,9 +103,13 @@ struct Testbed {
+     cfg: TestbedConfig,
+     up: Arc<Bucket>,
+     down: Arc<Bucket>,
+-    peer_rates: Mutex<HashMap<IpAddr, f64>>,
++    /// Peer IP -> (estimated throughput in bytes per second, last update).
++    peer_rates: Mutex<HashMap<IpAddr, (f64, Instant)>>,
++    /// Peer IP -> block replies this node has requested and not yet measured.
++    expected: Mutex<HashMap<IpAddr, u32>>,
+     gate: Mutex<GateInner>,
+     log: Option<Mutex<std::fs::File>>,
++    log_bytes: AtomicU64,
+ }
+ 
+ static TESTBED: OnceLock<Testbed> = OnceLock::new();
+@@ -92,7 +122,17 @@ fn scaled(d: Duration) -> Duration {
+ }
+ 
+ /// Installs the testbed. Must be called inside a Tokio runtime, before `zebra_network::init`.
++///
++/// # Panics
++///
++/// If called twice, if the log path can't be opened, or if a rate or scale is not positive.
+ pub fn install(cfg: TestbedConfig) {
++    assert!(
++        [cfg.upload_mbps, cfg.download_mbps, cfg.time_scale]
++            .iter()
++            .all(|v| v.is_finite() && *v > 0.0),
++        "testbed rates and time scale must be positive and finite"
++    );
+     let log = cfg.log_path.as_ref().map(|p| {
+         Mutex::new(
+             std::fs::OpenOptions::new()
+@@ -106,14 +146,21 @@ pub fn install(cfg: TestbedConfig) {
+         up: Arc::new(Bucket::new(cfg.upload_mbps * 1e6 / 8.0)),
+         down: Arc::new(Bucket::new(cfg.download_mbps * 1e6 / 8.0)),
+         peer_rates: Mutex::new(HashMap::new()),
++        expected: Mutex::new(HashMap::new()),
+         gate: Mutex::new(GateInner::default()),
+         log,
++        log_bytes: AtomicU64::new(0),
+         cfg,
+     };
+     if TESTBED.set(tb).is_err() {
+         panic!("testbed installed twice");
+     }
+-    if !TESTBED.get().expect("just set").cfg.priority_upload {
++    if !TESTBED
++        .get()
++        .expect("the testbed was set just above")
++        .cfg
++        .priority_upload
++    {
+         return;
+     }
+     tokio::spawn(async {
+@@ -127,17 +174,24 @@ pub fn install(cfg: TestbedConfig) {
+     });
+ }
+ 
+-/// Writes one line to the testbed event log.
++/// Writes one line to the testbed event log, until the log reaches its size cap.
+ pub fn log_event(line: &str) {
+-    if let Some(tb) = TESTBED.get() {
+-        if let Some(log) = &tb.log {
+-            let ms = std::time::SystemTime::now()
+-                .duration_since(std::time::UNIX_EPOCH)
+-                .map(|d| d.as_micros())
+-                .unwrap_or_default();
+-            let mut f = log.lock().expect("log lock is not poisoned");
+-            let _ = writeln!(f, "{} {}", ms, line);
+-        }
++    let Some(tb) = TESTBED.get() else { return };
++    let Some(log) = &tb.log else { return };
++    // `usize` to `u64` cannot truncate on any supported platform.
++    let len = line.len() as u64 + 20;
++    let before = tb.log_bytes.fetch_add(len, Ordering::Relaxed);
++    if before >= LOG_CAP_BYTES {
++        return;
++    }
++    let micros = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map(|d| d.as_micros())
++        .unwrap_or_default();
++    let mut f = log.lock().expect("log lock is only held to write one line");
++    let _ = writeln!(f, "{micros} {line}");
++    if before + len >= LOG_CAP_BYTES {
++        let _ = writeln!(f, "{micros} LOG_TRUNCATED");
+     }
+ }
+ 
+@@ -148,9 +202,9 @@ pub fn peer_rate_estimates() -> Vec<(IpAddr, f64)> {
+         .map(|tb| {
+             tb.peer_rates
+                 .lock()
+-                .expect("lock is not poisoned")
++                .expect("rate lock is never held across a panic")
+                 .iter()
+-                .map(|(ip, r)| (*ip, r * 8.0 / 1e6))
++                .map(|(ip, (r, _))| (*ip, r * 8.0 / 1e6))
+                 .collect()
+         })
+         .unwrap_or_default()
+@@ -158,13 +212,30 @@ pub fn peer_rate_estimates() -> Vec<(IpAddr, f64)> {
+ 
+ /// Seeds this node's throughput estimate for a peer, in megabits per second
+ /// (for experiments that start from a long-running node's state).
+-pub fn seed_peer_rate(peer: IpAddr, mbps: f64) {
+-    if let Some(tb) = TESTBED.get() {
+-        tb.peer_rates
+-            .lock()
+-            .expect("lock is not poisoned")
+-            .insert(peer, mbps * 1e6 / 8.0);
++///
++/// Returns an error if the testbed is not installed or `mbps` is not a positive finite number.
++pub fn seed_peer_rate(peer: IpAddr, mbps: f64) -> Result<(), &'static str> {
++    let tb = TESTBED.get().ok_or("testbed is not installed")?;
++    if !mbps.is_finite() || mbps <= 0.0 {
++        return Err("throughput estimates must be positive and finite");
+     }
++    tb.store_rate(peer, mbps * 1e6 / 8.0, false);
++    Ok(())
++}
++
++/// Records that `peer` now owes this node `count` requested blocks.
++///
++/// Only bursts that answer such requests are used as throughput samples, so unsolicited data
++/// can't raise a peer's rank.
++pub(crate) fn expect_block_replies(peer: IpAddr, count: usize) {
++    let Some(tb) = TESTBED.get() else { return };
++    let mut expected = tb
++        .expected
++        .lock()
++        .expect("expected-replies lock is never held across a panic");
++    let n = u32::try_from(count).unwrap_or(u32::MAX);
++    let e = expected.entry(peer).or_insert(0);
++    *e = e.saturating_add(n).min(MAX_EXPECTED_REPLIES);
+ }
+ 
+ /// How many of `peers` connected peers a relayed block advert goes to.
+@@ -176,6 +247,16 @@ pub(crate) fn broadcast_peer_count(peers: usize, default: usize) -> usize {
+     }
+ }
+ 
++/// The interval between accepted inbound connections: short while the testbed is installed,
++/// so that many local nodes can connect at startup.
++pub(crate) fn inbound_connection_interval(default: Duration) -> Duration {
++    if TESTBED.get().is_some() {
++        Duration::from_millis(20)
++    } else {
++        default
++    }
++}
++
+ // ---------------------------------------------------------------------------------------------
+ // Token buckets
+ 
+@@ -214,7 +295,10 @@ impl Bucket {
+ 
+     /// How long to wait before sending more, if the bucket is in debt.
+     fn wait(&self) -> Option<Duration> {
+-        let mut st = self.state.lock().expect("lock is not poisoned");
++        let mut st = self
++            .state
++            .lock()
++            .expect("bucket lock is never held across a panic");
+         self.refill(&mut st);
+         if st.0 >= 0.0 {
+             None
+@@ -224,11 +308,16 @@ impl Bucket {
+     }
+ 
+     fn consume(&self, n: usize) {
+-        let mut st = self.state.lock().expect("lock is not poisoned");
++        let mut st = self
++            .state
++            .lock()
++            .expect("bucket lock is never held across a panic");
+         self.refill(&mut st);
+         if self.rate.is_finite() {
++            // `usize` to `f64` is exact for any single read or write size.
+             st.0 -= n as f64;
+         }
++        // `usize` to `u64` cannot truncate on any supported platform.
+         self.total.fetch_add(n as u64, Ordering::Relaxed);
+     }
+ }
+@@ -236,22 +325,31 @@ impl Bucket {
+ // ---------------------------------------------------------------------------------------------
+ // Shaped streams
+ 
++/// What the reader task hands to the stream: delivery time and bytes, or the socket's error.
++type Chunk = Result<(Instant, Bytes), io::Error>;
++
+ /// A peer connection with emulated bandwidth and latency.
+ pub struct ShapedStream {
+     write: OwnedWriteHalf,
+-    rx: mpsc::Receiver<(Instant, Bytes)>,
++    rx: mpsc::Receiver<Chunk>,
+     pending: Option<(Instant, Bytes)>,
+     read_sleep: Option<Pin<Box<Sleep>>>,
+     write_sleep: Option<Pin<Box<Sleep>>>,
+     up: Arc<Bucket>,
++    /// The task reading the socket. Aborted on drop, so the socket closes with the stream.
++    reader: JoinHandle<()>,
+ }
+ 
+-fn link_latency(a: IpAddr, b: IpAddr) -> Duration {
+-    let Some(tb) = TESTBED.get() else {
+-        return Duration::ZERO;
+-    };
++impl Drop for ShapedStream {
++    fn drop(&mut self) {
++        self.reader.abort();
++    }
++}
++
++fn link_latency(tb: &Testbed, a: IpAddr, b: IpAddr) -> Duration {
+     let key = |ip: IpAddr| match ip {
+-        IpAddr::V4(v4) => u32::from(v4) as u64,
++        IpAddr::V4(v4) => u64::from(u32::from(v4)),
++        // Truncation is intended: this only seeds a hash.
+         IpAddr::V6(v6) => u128::from(v6) as u64,
+     };
+     let (x, y) = (key(a).min(key(b)), key(a).max(key(b)));
+@@ -261,9 +359,10 @@ fn link_latency(a: IpAddr, b: IpAddr) -> Duration {
+     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+     z ^= z >> 31;
++    // The top 53 bits convert to `f64` exactly, giving a uniform value in [0, 1).
+     let u = (z >> 11) as f64 / (1u64 << 53) as f64;
+     let ms = tb.cfg.latency_min_ms + u * (tb.cfg.latency_max_ms - tb.cfg.latency_min_ms);
+-    Duration::from_secs_f64(ms / 1000.0)
++    Duration::from_secs_f64(ms.max(0.0) / 1000.0)
+ }
+ 
+ /// Opens an outbound connection, bound to this node's testbed IP when installed.
+@@ -281,6 +380,7 @@ pub(crate) async fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
+             TcpSocket::new_v6()?
+         };
+         sock.bind(SocketAddr::new(tb.cfg.own_ip, 0))?;
++        // SOCK_BUF is a small constant that fits in `u32`.
+         sock.set_send_buffer_size(SOCK_BUF as u32)?;
+         sock.set_recv_buffer_size(SOCK_BUF as u32)?;
+         match sock.connect(addr).await {
+@@ -293,20 +393,35 @@ pub(crate) async fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
+ }
+ 
+ /// Wraps a connected peer stream in the testbed link emulation.
++///
++/// Without [`install`], bytes pass straight through with at most two chunks buffered.
+ pub(crate) fn wrap(stream: TcpStream, peer: SocketAddr) -> ShapedStream {
+-    let (up, down, lat) = match TESTBED.get() {
++    let (up, down, lat, chunks) = match TESTBED.get() {
+         Some(tb) => {
+             let sref = socket2::SockRef::from(&stream);
+             let _ = sref.set_send_buffer_size(SOCK_BUF);
+             let _ = sref.set_recv_buffer_size(SOCK_BUF);
+-            (tb.up.clone(), tb.down.clone(), link_latency(tb.cfg.own_ip, peer.ip()))
++            let _ = stream.set_nodelay(true);
++            let lat = link_latency(tb, tb.cfg.own_ip, peer.ip());
++            // Buffer only what the emulated link holds in flight (rate x latency), plus slack.
++            // CHUNK converts to `f64` exactly.
++            let in_flight = tb.down.rate * lat.as_secs_f64() / CHUNK as f64;
++            // A finite, non-negative float converts to `usize` with saturation.
++            let chunks = (in_flight.ceil() as usize)
++                .saturating_add(4)
++                .min(MAX_CHUNKS);
++            (tb.up.clone(), tb.down.clone(), lat, chunks)
+         }
+-        None => (Arc::new(Bucket::unlimited()), Arc::new(Bucket::unlimited()), Duration::ZERO),
++        None => (
++            Arc::new(Bucket::unlimited()),
++            Arc::new(Bucket::unlimited()),
++            Duration::ZERO,
++            PASSTHROUGH_CHUNKS,
++        ),
+     };
+-    let _ = stream.set_nodelay(true);
+     let (read, write) = stream.into_split();
+-    let (tx, rx) = mpsc::channel(256);
+-    tokio::spawn(reader(read, tx, down, lat, peer.ip()));
++    let (tx, rx) = mpsc::channel(chunks);
++    let reader = tokio::spawn(reader(read, tx, down, lat, peer.ip()));
+     ShapedStream {
+         write,
+         rx,
+@@ -314,42 +429,63 @@ pub(crate) fn wrap(stream: TcpStream, peer: SocketAddr) -> ShapedStream {
+         read_sleep: None,
+         write_sleep: None,
+         up,
++        reader,
+     }
+ }
+ 
++/// A contiguous run of received bytes from one peer.
++struct Burst {
++    start: Instant,
++    last: Instant,
++    bytes: u64,
++    /// Bytes in the first read, which arrived before `start` and so are left out of the rate.
++    first: u64,
++}
++
+ async fn reader(
+     mut read: OwnedReadHalf,
+-    tx: mpsc::Sender<(Instant, Bytes)>,
++    tx: mpsc::Sender<Chunk>,
+     down: Arc<Bucket>,
+     lat: Duration,
+     peer: IpAddr,
+ ) {
+     let mut buf = vec![0u8; CHUNK];
+-    let mut burst: Option<(Instant, Instant, u64, usize)> = None; // start, last, bytes, first chunk
++    let mut burst: Option<Burst> = None;
+     loop {
+         while let Some(d) = down.wait() {
+             tokio::time::sleep(d).await;
+         }
+         let n = match read.read(&mut buf).await {
+-            Ok(0) | Err(_) => break,
++            Ok(0) => break,
+             Ok(n) => n,
++            Err(e) => {
++                let _ = tx.send(Err(e)).await;
++                break;
++            }
+         };
+         down.consume(n);
+         let now = Instant::now();
++        // `usize` to `u64` cannot truncate on any supported platform.
++        let n64 = n as u64;
+         match &mut burst {
+-            Some((_, last, bytes, _)) if now.saturating_duration_since(*last) <= scaled(BURST_GAP) => {
+-                *bytes += n as u64;
+-                *last = now;
++            Some(b) if now.saturating_duration_since(b.last) <= scaled(BURST_GAP) => {
++                b.bytes += n64;
++                b.last = now;
+             }
+             _ => {
+                 if let Some(b) = burst.take() {
+                     record_burst(peer, b);
+                 }
+-                burst = Some((now, now, n as u64, n));
++                burst = Some(Burst {
++                    start: now,
++                    last: now,
++                    bytes: n64,
++                    first: n64,
++                });
+             }
+         }
+         if tx
+-            .send((now + lat, Bytes::copy_from_slice(&buf[..n])))
++            .send(Ok((now + lat, Bytes::copy_from_slice(&buf[..n]))))
+             .await
+             .is_err()
+         {
+@@ -361,19 +497,35 @@ async fn reader(
+     }
+ }
+ 
+-fn record_burst(peer: IpAddr, (start, last, bytes, first): (Instant, Instant, u64, usize)) {
+-    let dur = last.saturating_duration_since(start).as_secs_f64();
+-    if bytes < MIN_SAMPLE_BYTES || dur <= 0.0 {
++fn record_burst(peer: IpAddr, b: Burst) {
++    let Some(tb) = TESTBED.get() else { return };
++    let dur = b.last.saturating_duration_since(b.start).as_secs_f64();
++    if b.bytes < MIN_SAMPLE_BYTES || dur <= 0.0 {
+         return;
+     }
+-    let rate = (bytes - first as u64) as f64 / dur;
+-    if let Some(tb) = TESTBED.get() {
+-        let mut rates = tb.peer_rates.lock().expect("lock is not poisoned");
+-        let e = rates.entry(peer).or_insert(rate);
+-        *e = 0.5 * *e + 0.5 * rate;
+-        drop(rates);
+-        log_event(&format!("RATE {} {:.1}", peer, rate * 8.0 / 1e6));
++    // Only count bursts that answer a block request this node made.
++    {
++        let mut expected = tb
++            .expected
++            .lock()
++            .expect("expected-replies lock is never held across a panic");
++        match expected.get_mut(&peer) {
++            Some(n) if *n > 0 => {
++                *n -= 1;
++                if *n == 0 {
++                    expected.remove(&peer);
++                }
++            }
++            _ => return,
++        }
++    }
++    // `u64` to `f64` is exact below 2^53 bytes.
++    let rate = (b.bytes - b.first) as f64 / dur;
++    if !rate.is_finite() || rate <= 0.0 {
++        return;
+     }
++    tb.store_rate(peer, rate, true);
++    log_event(&format!("RATE {} {:.1}", peer, rate * 8.0 / 1e6));
+ }
+ 
+ impl AsyncRead for ShapedStream {
+@@ -383,14 +535,20 @@ impl AsyncRead for ShapedStream {
+         out: &mut ReadBuf<'_>,
+     ) -> Poll<io::Result<()>> {
+         let this = &mut *self;
++        if out.remaining() == 0 {
++            return Poll::Ready(Ok(()));
++        }
+         if this.pending.is_none() {
+             match this.rx.poll_recv(cx) {
+-                Poll::Ready(Some(item)) => this.pending = Some(item),
++                Poll::Ready(Some(Ok(item))) => this.pending = Some(item),
++                Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
+                 Poll::Ready(None) => return Poll::Ready(Ok(())),
+                 Poll::Pending => return Poll::Pending,
+             }
+         }
+-        let due = this.pending.as_ref().expect("just set").0;
++        let Some(due) = this.pending.as_ref().map(|(due, _)| *due) else {
++            return Poll::Pending;
++        };
+         if Instant::now() < due {
+             let sleep = this
+                 .read_sleep
+@@ -403,11 +561,12 @@ impl AsyncRead for ShapedStream {
+             }
+         }
+         this.read_sleep = None;
+-        let (_, bytes) = this.pending.as_mut().expect("just set");
+-        let n = out.remaining().min(bytes.len());
+-        out.put_slice(&bytes.split_to(n));
+-        if bytes.is_empty() {
+-            this.pending = None;
++        if let Some((_, bytes)) = this.pending.as_mut() {
++            let n = out.remaining().min(bytes.len());
++            out.put_slice(&bytes.split_to(n));
++            if bytes.is_empty() {
++                this.pending = None;
++            }
+         }
+         Poll::Ready(Ok(()))
+     }
+@@ -452,26 +611,90 @@ impl AsyncWrite for ShapedStream {
+ // ---------------------------------------------------------------------------------------------
+ // Priority-fill upload scheduler
+ 
++/// A block request waiting for upload capacity.
++struct Waiter {
++    est: f64,
++    id: u64,
++    queued: Instant,
++    /// This peer already received these blocks from this node: serve it last.
++    repeat: bool,
++    tx: oneshot::Sender<Slot>,
++}
++
+ #[derive(Default)]
+ struct GateInner {
+     active: usize,
+-    waiting: Vec<(f64, u64, oneshot::Sender<()>)>,
++    waiting: Vec<Waiter>,
+     next_id: u64,
+     last_admit: Option<Instant>,
+     samples: VecDeque<(Instant, u64)>,
++    /// (peer, block) pairs already served, oldest first, to detect repeated requests.
++    served: HashSet<(IpAddr, block::Hash)>,
++    served_order: VecDeque<(IpAddr, block::Hash)>,
++}
++
++/// One admitted transfer. Releases its upload slot when dropped, wherever it is dropped:
++/// in the guard after the write, or unread inside a cancelled request's channel.
++struct Slot {
++    armed: bool,
++}
++
++impl Drop for Slot {
++    fn drop(&mut self) {
++        if !self.armed {
++            return;
++        }
++        if let Some(tb) = TESTBED.get() {
++            let mut g = tb
++                .gate
++                .lock()
++                .expect("gate lock is never held across a panic");
++            g.active = g.active.saturating_sub(1);
++            tb.admit(&mut g, Instant::now());
++        }
++    }
+ }
+ 
+ impl Testbed {
++    fn store_rate(&self, peer: IpAddr, rate: f64, average: bool) {
++        let now = Instant::now();
++        let mut rates = self
++            .peer_rates
++            .lock()
++            .expect("rate lock is never held across a panic");
++        let ttl = scaled(ESTIMATE_TTL);
++        rates.retain(|_, (_, at)| now.saturating_duration_since(*at) <= ttl);
++        if rates.len() >= MAX_ESTIMATES && !rates.contains_key(&peer) {
++            if let Some(oldest) = rates
++                .iter()
++                .min_by_key(|(_, (_, at))| *at)
++                .map(|(ip, _)| *ip)
++            {
++                rates.remove(&oldest);
++            }
++        }
++        let e = rates.entry(peer).or_insert((rate, now));
++        e.0 = if average {
++            0.5 * e.0 + 0.5 * rate
++        } else {
++            rate
++        };
++        e.1 = now;
++    }
++
+     fn rate_estimate(&self, peer: Option<IpAddr>) -> f64 {
+-        let rates = self.peer_rates.lock().expect("lock is not poisoned");
+-        if let Some(r) = peer.and_then(|p| rates.get(&p)) {
++        let rates = self
++            .peer_rates
++            .lock()
++            .expect("rate lock is never held across a panic");
++        if let Some((r, _)) = peer.and_then(|p| rates.get(&p)) {
+             return *r;
+         }
+-        if rates.is_empty() {
+-            return 50e6 / 8.0;
++        let mut v: Vec<f64> = rates.values().map(|(r, _)| *r).collect();
++        if v.is_empty() {
++            return DEFAULT_RATE;
+         }
+-        let mut v: Vec<f64> = rates.values().copied().collect();
+-        v.sort_by(|a, b| a.partial_cmp(b).expect("rates are finite"));
++        v.sort_by(f64::total_cmp);
+         v[v.len() / 2]
+     }
+ 
+@@ -483,25 +706,55 @@ impl Testbed {
+         if dt < scaled(UTIL_WINDOW).as_secs_f64() * 0.5 {
+             return 1.0;
+         }
++        // Byte counts convert to `f64` exactly below 2^53.
+         (last.1 - first.1) as f64 / (self.up.rate * dt)
+     }
+ 
+     /// Samples upload utilization and admits waiting transfers if there is spare capacity.
+     fn pump(&self) {
+         let now = Instant::now();
+-        let mut g = self.gate.lock().expect("lock is not poisoned");
++        let mut g = self
++            .gate
++            .lock()
++            .expect("gate lock is never held across a panic");
+         g.samples
+             .push_back((now, self.up.total.load(Ordering::Relaxed)));
++        let window = scaled(UTIL_WINDOW);
+         while g
+             .samples
+             .front()
+-            .is_some_and(|(t, _)| now.saturating_duration_since(*t) > scaled(UTIL_WINDOW))
++            .is_some_and(|(t, _)| now.saturating_duration_since(*t) > window)
+         {
+             g.samples.pop_front();
+         }
+         self.admit(&mut g, now);
+     }
+ 
++    /// Picks the next waiter: anyone overdue first (oldest first), then fresh requests by
++    /// estimate, then repeats.
++    fn pick(&self, g: &GateInner, now: Instant) -> Option<usize> {
++        let overdue = scaled(MAX_FAIR_WAIT);
++        if let Some((i, _)) = g
++            .waiting
++            .iter()
++            .enumerate()
++            .filter(|(_, w)| now.saturating_duration_since(w.queued) >= overdue)
++            .min_by_key(|(_, w)| w.id)
++        {
++            return Some(i);
++        }
++        g.waiting
++            .iter()
++            .enumerate()
++            .max_by(|(_, a), (_, b)| {
++                b.repeat
++                    .cmp(&a.repeat)
++                    .then(a.est.total_cmp(&b.est))
++                    .then(b.id.cmp(&a.id))
++            })
++            .map(|(i, _)| i)
++    }
++
+     fn admit(&self, g: &mut GateInner, now: Instant) {
+         loop {
+             if g.waiting.is_empty() {
+@@ -515,79 +768,122 @@ impl Testbed {
+             if !spare {
+                 return;
+             }
+-            // Highest estimated relay rate first, then earliest request.
+-            let best = g
+-                .waiting
+-                .iter()
+-                .enumerate()
+-                .max_by(|(_, a), (_, b)| {
+-                    a.0.partial_cmp(&b.0)
+-                        .expect("rates are finite")
+-                        .then(b.1.cmp(&a.1))
+-                })
+-                .map(|(i, _)| i)
+-                .expect("waiting is not empty");
+-            let (_, _, tx) = g.waiting.swap_remove(best);
+-            if tx.send(()).is_ok() {
+-                g.active += 1;
+-                g.last_admit = Some(now);
+-                if g.active > 1 {
+-                    return;
++            let Some(best) = self.pick(g, now) else {
++                return;
++            };
++            let waiter = g.waiting.swap_remove(best);
++            g.active += 1;
++            match waiter.tx.send(Slot { armed: true }) {
++                Ok(()) => {
++                    g.last_admit = Some(now);
++                    if g.active > 1 {
++                        return;
++                    }
++                }
++                Err(mut slot) => {
++                    // The request was cancelled before admission: undo without re-locking.
++                    slot.armed = false;
++                    g.active -= 1;
+                 }
+             }
+         }
+     }
++
++    /// Remembers that `peer` was sent `hashes`; returns whether any was sent before.
++    fn note_served(&self, g: &mut GateInner, peer: IpAddr, hashes: &[block::Hash]) -> bool {
++        let mut repeat = false;
++        for h in hashes {
++            if !g.served.insert((peer, *h)) {
++                repeat = true;
++                continue;
++            }
++            g.served_order.push_back((peer, *h));
++            if g.served_order.len() > MAX_SERVED {
++                if let Some(old) = g.served_order.pop_front() {
++                    g.served.remove(&old);
++                }
++            }
++        }
++        repeat
++    }
+ }
+ 
+ /// Held while a block response is being written to a peer.
+ pub(crate) struct ServeGuard {
+     peer: Option<IpAddr>,
+-    gated: bool,
++    _slot: Option<Slot>,
+ }
+ 
+ impl Drop for ServeGuard {
+     fn drop(&mut self) {
+-        let Some(tb) = TESTBED.get() else { return };
+         log_event(&format!(
+             "SERVE_END {}",
+             self.peer.map(|p| p.to_string()).unwrap_or_default()
+         ));
+-        if self.gated {
+-            let mut g = tb.gate.lock().expect("lock is not poisoned");
+-            g.active = g.active.saturating_sub(1);
+-            tb.admit(&mut g, Instant::now());
+-        }
+     }
+ }
+ 
+-/// Waits until this node's upload scheduler lets a block response to `peer` start.
+-pub(crate) async fn serve_blocks(peer: Option<IpAddr>) -> Option<ServeGuard> {
++/// Waits until this node's upload scheduler lets a response carrying `hashes` to `peer` start.
++///
++/// Requests that wait longer than a bounded time are served without a free slot, so a
++/// connection is never blocked here for long.
++pub(crate) async fn serve_blocks(
++    peer: Option<IpAddr>,
++    hashes: Vec<block::Hash>,
++) -> Option<ServeGuard> {
+     let tb = TESTBED.get()?;
+     let peer_label = peer.map(|p| p.to_string()).unwrap_or_default();
+     if !tb.cfg.priority_upload {
+-        log_event(&format!("SERVE_START {} 0", peer_label));
+-        return Some(ServeGuard { peer, gated: false });
++        log_event(&format!("SERVE_START {peer_label} 0"));
++        return Some(ServeGuard { peer, _slot: None });
+     }
+     let est = tb.rate_estimate(peer);
+     let (tx, rx) = oneshot::channel();
++    let queued = Instant::now();
++    let repeat;
+     {
+-        let mut g = tb.gate.lock().expect("lock is not poisoned");
++        let mut g = tb
++            .gate
++            .lock()
++            .expect("gate lock is never held across a panic");
++        repeat = peer.is_some_and(|p| tb.note_served(&mut g, p, &hashes));
+         let id = g.next_id;
+         g.next_id += 1;
+-        g.waiting.push((est, id, tx));
+-        tb.admit(&mut g, Instant::now());
+-    }
+-    let queued = Instant::now();
+-    if rx.await.is_err() {
+-        return None;
++        g.waiting.push(Waiter {
++            est,
++            id,
++            queued,
++            repeat,
++            tx,
++        });
++        tb.admit(&mut g, queued);
+     }
++    let slot = match tokio::time::timeout(scaled(MAX_GATE_WAIT), rx).await {
++        Ok(Ok(slot)) => slot,
++        Ok(Err(_)) => return None,
++        Err(_) => {
++            // Waited too long: go ahead anyway, holding a slot so accounting stays right.
++            // The timed-out receiver is dropped, so the queued entry is skipped when picked.
++            let mut g = tb
++                .gate
++                .lock()
++                .expect("gate lock is never held across a panic");
++            g.active += 1;
++            log_event(&format!("SERVE_TIMEOUT {peer_label}"));
++            Slot { armed: true }
++        }
++    };
+     log_event(&format!(
+-        "SERVE_START {} {:.0} est={:.1}",
++        "SERVE_START {} {:.0} est={:.1}{}",
+         peer_label,
+         queued.elapsed().as_secs_f64() * 1000.0,
+-        est * 8.0 / 1e6
++        est * 8.0 / 1e6,
++        if repeat { " repeat" } else { "" },
+     ));
+-    Some(ServeGuard { peer, gated: true })
++    Some(ServeGuard {
++        peer,
++        _slot: Some(slot),
++    })
+ }
+ 
+ #[cfg(test)]
+diff --git a/zebra-network/src/testbed/tests.rs b/zebra-network/src/testbed/tests.rs
+index 1b7f057..ed0b501 100644
+--- a/zebra-network/src/testbed/tests.rs
++++ b/zebra-network/src/testbed/tests.rs
+@@ -29,6 +29,14 @@ fn cfg(priority: bool) -> TestbedConfig {
+     }
+ }
+ 
++fn ip(s: &str) -> IpAddr {
++    s.parse().expect("test IPs are valid")
++}
++
++fn hash(n: u8) -> block::Hash {
++    block::Hash([n; 32])
++}
++
+ /// A connected pair: (raw client socket, server side wrapped in a ShapedStream).
+ async fn pair() -> (TcpStream, ShapedStream) {
+     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+@@ -39,19 +47,34 @@ async fn pair() -> (TcpStream, ShapedStream) {
+ }
+ 
+ fn open_fds() -> usize {
+-    std::fs::read_dir("/proc/self/fd").map(|d| d.count()).unwrap_or(0)
++    std::fs::read_dir("/proc/self/fd")
++        .map(|d| d.count())
++        .unwrap_or(0)
+ }
+ 
+ fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
+     let mut z = seed;
+     (0..len)
+         .map(|_| {
+-            z = z.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+-            (z >> 33) as u8
++            z = z
++                .wrapping_mul(6364136223846793005)
++                .wrapping_add(1442695040888963407);
++            // Taking the high byte is the intent.
++            (z >> 56) as u8
+         })
+         .collect()
+ }
+ 
++fn active_slots() -> usize {
++    TESTBED
++        .get()
++        .expect("installed")
++        .gate
++        .lock()
++        .expect("lock")
++        .active
++}
++
+ /// Bytes written in odd-sized pieces arrive intact and in order, in both directions.
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn stream_integrity_without_install() {
+@@ -72,10 +95,8 @@ async fn stream_integrity_without_install() {
+     });
+     let mut got = Vec::new();
+     server.read_to_end(&mut got).await.expect("read");
+-    assert_eq!(got.len(), data.len());
+     assert!(got == data, "stream corrupted");
+ 
+-    // and the other direction, through the shaped writer
+     let mut client = writer.await.expect("join");
+     let back = pseudo_random(2 * 1024 * 1024 + 5, 9);
+     server.write_all(&back).await.expect("write back");
+@@ -95,7 +116,6 @@ async fn stream_integrity_with_install() {
+     tokio::spawn(async move {
+         client.write_all(&send).await.expect("write");
+         client.shutdown().await.expect("shutdown");
+-        // keep the socket open until the reader finishes
+         tokio::time::sleep(Duration::from_secs(5)).await;
+     });
+     let start = Instant::now();
+@@ -104,48 +124,32 @@ async fn stream_integrity_with_install() {
+     assert!(got == data, "stream corrupted under shaping");
+     // 2 MiB at 100 Mb/s download takes about 168 ms
+     let took = start.elapsed();
+-    assert!(took >= Duration::from_millis(140), "download not shaped: {took:?}");
++    assert!(
++        took >= Duration::from_millis(140),
++        "download not shaped: {took:?}"
++    );
+ }
+ 
+-/// FINDING: dropping a ShapedStream does not close its socket while the peer stays silent,
+-/// because the detached reader task still owns the read half.
++/// Fixed finding 2: dropping a stream closes its socket even if the peer stays silent.
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn dropped_stream_leaks_socket_while_peer_is_silent() {
++async fn dropped_stream_closes_socket() {
+     let before = open_fds();
+     let mut clients = Vec::new();
+     for _ in 0..50 {
+         let (client, server) = pair().await;
+-        drop(server); // what Zebra does when it disconnects or bans a peer
+-        clients.push(client); // the "attacker" keeps its end open and never sends
++        drop(server);
++        clients.push(client);
+     }
+     tokio::time::sleep(Duration::from_millis(500)).await;
+-    let after = open_fds();
+-    // 50 client sockets are expected; anything above that is a leaked server socket.
+-    let leaked = after.saturating_sub(before).saturating_sub(50);
+-    println!("fds before {before}, after {after}, leaked server sockets: {leaked}");
+-    assert!(leaked >= 45, "expected the leak to reproduce, got {leaked}");
+-
+-    // control: plain TcpStream closes immediately
+-    let before = open_fds();
+-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+-    let addr = listener.local_addr().expect("addr");
+-    let mut plain_clients = Vec::new();
+-    for _ in 0..50 {
+-        let c = TcpStream::connect(addr).await.expect("connect");
+-        let (s, _) = listener.accept().await.expect("accept");
+-        drop(s);
+-        plain_clients.push(c);
+-    }
+-    tokio::time::sleep(Duration::from_millis(200)).await;
+-    let leaked_plain = open_fds().saturating_sub(before).saturating_sub(51);
+-    println!("plain TcpStream leaked: {leaked_plain}");
+-    assert_eq!(leaked_plain, 0);
++    let leaked = open_fds().saturating_sub(before).saturating_sub(50);
++    println!("leaked server sockets: {leaked}");
++    assert!(leaked <= 1, "sockets leaked: {leaked}");
+ }
+ 
+-/// FINDING: the reader task buffers far more unread data than the kernel would,
+-/// removing TCP backpressure (memory per connection grows to the channel's size).
++/// Fixed finding 5: without the testbed installed, unread data is not buffered in user space
++/// beyond a couple of chunks.
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn unread_data_is_buffered_in_userspace() {
++async fn unread_data_is_bounded() {
+     async fn accepted_without_reading(wrapped: bool) -> usize {
+         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+         let addr = listener.local_addr().expect("addr");
+@@ -172,79 +176,117 @@ async fn unread_data_is_buffered_in_userspace() {
+     let plain = accepted_without_reading(false).await;
+     let shaped = accepted_without_reading(true).await;
+     println!("bytes accepted with nobody reading: plain {plain}, shaped {shaped}");
+-    assert!(shaped > plain + 2 * 1024 * 1024, "expected extra userspace buffering");
++    assert!(
++        shaped <= plain + 256 * 1024,
++        "user-space buffering not bounded: {shaped} vs {plain}"
++    );
++}
++
++/// Fixed finding 17: a socket error reaches the reader as an error, not a clean end of stream.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn socket_errors_are_forwarded() {
++    let (client, mut server) = pair().await;
++    // Close with a reset (linger 0) so the server sees an error.
++    socket2::SockRef::from(&client)
++        .set_linger(Some(Duration::ZERO))
++        .expect("set linger");
++    drop(client);
++    let mut buf = Vec::new();
++    let result = server.read_to_end(&mut buf).await;
++    println!("read after reset: {result:?}");
++    assert!(result.is_err(), "reset was reported as a clean close");
+ }
+ 
+ /// The scheduler serves the highest-estimate waiting peer first.
+ #[tokio::test(flavor = "current_thread")]
+ async fn gate_admits_highest_estimate_first() {
+     install(cfg(true));
+-    let slow: IpAddr = "10.0.0.1".parse().expect("ip");
+-    let fast: IpAddr = "10.0.0.2".parse().expect("ip");
+-    let mid: IpAddr = "10.0.0.3".parse().expect("ip");
+-    seed_peer_rate(slow, 5.0);
+-    seed_peer_rate(fast, 500.0);
+-    seed_peer_rate(mid, 50.0);
++    let (slow, fast, mid) = (ip("10.0.0.1"), ip("10.0.0.2"), ip("10.0.0.3"));
++    seed_peer_rate(slow, 5.0).expect("valid");
++    seed_peer_rate(fast, 500.0).expect("valid");
++    seed_peer_rate(mid, 50.0).expect("valid");
+ 
+-    // Occupy the uplink so the others must queue.
+-    let first = serve_blocks(Some(slow)).await.expect("first admitted at once");
++    let first = serve_blocks(Some(slow), vec![hash(1)])
++        .await
++        .expect("first admitted at once");
+     let order = Arc::new(Mutex::new(Vec::new()));
+     let mut tasks = Vec::new();
+-    for ip in [mid, fast] {
++    for p in [mid, fast] {
+         let order = order.clone();
+         tasks.push(tokio::spawn(async move {
+-            let g = serve_blocks(Some(ip)).await.expect("admitted");
+-            order.lock().expect("lock").push(ip);
++            let g = serve_blocks(Some(p), vec![hash(1)])
++                .await
++                .expect("admitted");
++            order.lock().expect("lock").push(p);
+             tokio::time::sleep(Duration::from_millis(5)).await;
+             drop(g);
+         }));
+     }
+     tokio::task::yield_now().await;
+-    // Fake full utilization so nothing else is admitted while `first` is active.
+-    TESTBED.get().expect("installed").up.total.fetch_add(1 << 40, Ordering::Relaxed);
++    TESTBED
++        .get()
++        .expect("installed")
++        .up
++        .total
++        .fetch_add(1 << 40, Ordering::Relaxed);
+     drop(first);
+     for t in tasks {
+         t.await.expect("join");
+     }
+     let order = order.lock().expect("lock").clone();
+-    assert_eq!(order.first(), Some(&fast), "fast peer should be served first: {order:?}");
++    assert_eq!(
++        order.first(),
++        Some(&fast),
++        "fast peer should be served first: {order:?}"
++    );
+ }
+ 
+-/// FINDING: a request cancelled after it was admitted, but before it ran, leaks a slot.
++/// Fixed finding 9: a request cancelled after admission gives its slot back.
+ #[tokio::test(flavor = "current_thread")]
+-async fn cancelled_admission_leaks_an_active_slot() {
++async fn cancelled_admission_releases_slot() {
+     install(cfg(true));
+-    let a: IpAddr = "10.0.0.1".parse().expect("ip");
+-    let b: IpAddr = "10.0.0.2".parse().expect("ip");
+-    let first = serve_blocks(Some(a)).await.expect("admitted");
+-    let waiter = tokio::spawn(serve_blocks(Some(b)));
+-    tokio::task::yield_now().await; // waiter is now queued
+-    drop(first); // admits the waiter: its oneshot fires
+-    waiter.abort(); // the connection is torn down before the task runs again
++    let first = serve_blocks(Some(ip("10.0.0.1")), vec![hash(1)])
++        .await
++        .expect("admitted");
++    let waiter = tokio::spawn(serve_blocks(Some(ip("10.0.0.2")), vec![hash(1)]));
++    tokio::task::yield_now().await;
++    drop(first);
++    waiter.abort();
+     let _ = waiter.await;
+-    let active = TESTBED.get().expect("installed").gate.lock().expect("lock").active;
++    let active = active_slots();
+     println!("active slots with no transfer running: {active}");
+-    assert_eq!(active, 1, "expected the leaked slot to reproduce");
++    assert_eq!(active, 0, "slot leaked");
+ }
+ 
+-/// FINDING: a NaN estimate (from a malformed seed file) panics the scheduler.
++/// Fixed finding 10: non-finite estimates are rejected and can't crash the scheduler.
+ #[tokio::test(flavor = "current_thread")]
+-async fn nan_estimate_panics_scheduler() {
++async fn non_finite_estimates_are_rejected() {
+     install(cfg(true));
+-    seed_peer_rate("10.0.0.9".parse().expect("ip"), f64::NAN);
+-    seed_peer_rate("10.0.0.8".parse().expect("ip"), 10.0);
+-    let result = tokio::spawn(serve_blocks(Some("10.0.0.7".parse().expect("ip")))).await;
+-    assert!(result.is_err(), "expected a panic from the NaN comparison");
++    assert!(seed_peer_rate(ip("10.0.0.9"), f64::NAN).is_err());
++    assert!(seed_peer_rate(ip("10.0.0.9"), f64::INFINITY).is_err());
++    assert!(seed_peer_rate(ip("10.0.0.9"), -1.0).is_err());
++    seed_peer_rate(ip("10.0.0.8"), 10.0).expect("valid");
++    let g = serve_blocks(Some(ip("10.0.0.7")), vec![hash(1)]).await;
++    assert!(g.is_some());
+ }
+ 
+-/// FINDING: any large inbound burst counts as throughput, so a peer can raise its own
+-/// priority by sending unsolicited bulk data.
++/// Fixed finding 8: unsolicited bulk data does not create a throughput estimate,
++/// but a reply to a block request does.
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn unsolicited_bulk_data_raises_priority() {
++async fn only_solicited_replies_are_measured() {
+     install(cfg(true));
+     let (mut client, mut server) = pair().await;
+     let peer_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+-    assert!(TESTBED.get().expect("installed").peer_rates.lock().expect("lock").get(&peer_ip).is_none());
++    let estimate = || {
++        TESTBED
++            .get()
++            .expect("installed")
++            .peer_rates
++            .lock()
++            .expect("lock")
++            .get(&peer_ip)
++            .map(|(r, _)| r * 8.0 / 1e6)
++    };
+     let drain = tokio::spawn(async move {
+         let mut buf = vec![0u8; 65536];
+         while let Ok(n) = server.read(&mut buf).await {
+@@ -253,37 +295,54 @@ async fn unsolicited_bulk_data_raises_priority() {
+             }
+         }
+     });
+-    client.write_all(&vec![0xAB; 600 * 1024]).await.expect("junk");
+-    tokio::time::sleep(Duration::from_millis(400)).await; // end the burst
+-    client.write_all(b"x").await.expect("one more byte finalizes the sample");
++
++    // Unsolicited
++    client
++        .write_all(&vec![0xAB; 600 * 1024])
++        .await
++        .expect("junk");
++    tokio::time::sleep(Duration::from_millis(400)).await;
++    client.write_all(b"x").await.expect("finalize the burst");
++    tokio::time::sleep(Duration::from_millis(100)).await;
++    println!("estimate after unsolicited data: {:?}", estimate());
++    assert!(estimate().is_none(), "junk data created an estimate");
++
++    // Solicited
++    expect_block_replies(peer_ip, 1);
++    tokio::time::sleep(Duration::from_millis(400)).await;
++    client
++        .write_all(&vec![0xCD; 600 * 1024])
++        .await
++        .expect("reply");
++    tokio::time::sleep(Duration::from_millis(400)).await;
++    client.write_all(b"x").await.expect("finalize the burst");
+     tokio::time::sleep(Duration::from_millis(100)).await;
+-    let est = TESTBED.get().expect("installed").peer_rates.lock().expect("lock").get(&peer_ip).copied();
+-    println!("estimate after 600 KiB of junk: {:?} Mb/s", est.map(|r| r * 8.0 / 1e6));
+-    assert!(est.is_some(), "junk data created a throughput estimate");
++    println!("estimate after a requested reply: {:?}", estimate());
++    assert!(estimate().is_some(), "requested reply was not measured");
+     drop(client);
+     let _ = drain.await;
+ }
+ 
+-/// FINDING: strict priority with no aging lets a high-ranked peer that keeps re-requesting
+-/// starve a low-ranked peer indefinitely while the uplink stays busy.
++/// Fixed finding 6: a high-ranked peer that keeps re-requesting can no longer starve others.
+ #[tokio::test(flavor = "current_thread")]
+-async fn high_ranked_requester_can_starve_others() {
++async fn high_ranked_requester_cannot_starve_others() {
+     install(cfg(true));
+-    let attacker: IpAddr = "10.0.0.66".parse().expect("ip");
+-    let victim: IpAddr = "10.0.0.5".parse().expect("ip");
+-    seed_peer_rate(attacker, 1000.0);
+-    seed_peer_rate(victim, 10.0);
++    let attacker = ip("10.0.0.66");
++    let victim = ip("10.0.0.5");
++    seed_peer_rate(attacker, 1000.0).expect("valid");
++    seed_peer_rate(victim, 10.0).expect("valid");
+     let tb = TESTBED.get().expect("installed");
+ 
+-    // Two attacker request streams, so one is always queued when the other finishes.
+     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+     let mut attackers = Vec::new();
+-    for _ in 0..2 {
++    for stream in 0..2u8 {
+         let stop = stop.clone();
+         attackers.push(tokio::spawn(async move {
++            let mut n = 0u8;
+             while !stop.load(Ordering::Relaxed) {
+-                let g = serve_blocks(Some(attacker)).await;
+-                // a fast transfer that keeps the uplink saturated (100 Mb/s for 20 ms)
++                // fresh hashes, so this is not caught as a repeat
++                n = n.wrapping_add(1);
++                let g = serve_blocks(Some(attacker), vec![hash(n ^ (stream << 7))]).await;
+                 tb.up.total.fetch_add(250_000, Ordering::Relaxed);
+                 tokio::time::sleep(Duration::from_millis(20)).await;
+                 drop(g);
+@@ -292,15 +351,80 @@ async fn high_ranked_requester_can_starve_others() {
+     }
+     tokio::time::sleep(Duration::from_millis(30)).await;
+     let start = Instant::now();
+-    let victim_wait = tokio::time::timeout(Duration::from_secs(2), serve_blocks(Some(victim))).await;
++    let admitted = tokio::time::timeout(
++        Duration::from_secs(2),
++        serve_blocks(Some(victim), vec![hash(200)]),
++    )
++    .await;
++    let waited = start.elapsed();
+     stop.store(true, Ordering::Relaxed);
++    drop(admitted);
+     for a in attackers {
+         let _ = a.await;
+     }
+-    println!(
+-        "victim admitted: {}, waited {:?}",
+-        victim_wait.is_ok(),
+-        start.elapsed()
++    println!("victim waited {waited:?}");
++    assert!(
++        waited < Duration::from_millis(900),
++        "victim starved for {waited:?}"
+     );
+-    assert!(victim_wait.is_err(), "expected the victim to be starved for 2 s");
++}
++
++/// Fixed finding 6: a repeated request for a block already served goes to the back.
++#[tokio::test(flavor = "current_thread")]
++async fn repeated_requests_are_served_last() {
++    install(cfg(true));
++    let fast = ip("10.0.0.2");
++    let slow = ip("10.0.0.3");
++    seed_peer_rate(fast, 500.0).expect("valid");
++    seed_peer_rate(slow, 5.0).expect("valid");
++
++    // `fast` already got block 7 once.
++    drop(serve_blocks(Some(fast), vec![hash(7)]).await);
++
++    let holder = serve_blocks(Some(ip("10.0.0.9")), vec![hash(1)])
++        .await
++        .expect("admitted");
++    let order = Arc::new(Mutex::new(Vec::new()));
++    let mut tasks = Vec::new();
++    for p in [fast, slow] {
++        let order = order.clone();
++        tasks.push(tokio::spawn(async move {
++            let g = serve_blocks(Some(p), vec![hash(7)])
++                .await
++                .expect("admitted");
++            order.lock().expect("lock").push(p);
++            drop(g);
++        }));
++    }
++    tokio::task::yield_now().await;
++    TESTBED
++        .get()
++        .expect("installed")
++        .up
++        .total
++        .fetch_add(1 << 40, Ordering::Relaxed);
++    drop(holder);
++    for t in tasks {
++        t.await.expect("join");
++    }
++    let order = order.lock().expect("lock").clone();
++    assert_eq!(
++        order.first(),
++        Some(&slow),
++        "repeat should go last: {order:?}"
++    );
++}
++
++/// Fixed finding 11: the estimate map stays bounded.
++#[tokio::test(flavor = "current_thread")]
++async fn estimate_map_is_bounded() {
++    install(cfg(true));
++    for i in 0..(MAX_ESTIMATES + 100) {
++        // `usize` to `u32` cannot truncate for this loop's range.
++        let a = Ipv4Addr::from(0x0A00_0000u32 + i as u32);
++        seed_peer_rate(IpAddr::V4(a), 10.0).expect("valid");
++    }
++    let n = peer_rate_estimates().len();
++    println!("estimates stored: {n}");
++    assert!(n <= MAX_ESTIMATES);
+ }
+diff --git a/zebra-relay/Cargo.lock b/zebra-relay/Cargo.lock
+new file mode 100644
+index 0000000..6950637
+--- /dev/null
++++ b/zebra-relay/Cargo.lock
+@@ -0,0 +1,3343 @@
++# This file is automatically @generated by Cargo.
++# It is not intended for manual editing.
++version = 4
++
++[[package]]
++name = "addchain"
++version = "0.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5665045de74fda906c0abfaec40cf2551f88c34dccea869f3fe950dde7209764"
++dependencies = [
++ "num-bigint 0.4.6",
++ "num-integer",
++ "num-traits",
++]
++
++[[package]]
++name = "aead"
++version = "0.6.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1973cfbc1a2daf9cf550e74e1f088c28e7f7d8c1e1418fb6c9dc5184b7e84c99"
++dependencies = [
++ "crypto-common 0.2.2",
++ "inout",
++]
++
++[[package]]
++name = "aes"
++version = "0.9.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f8eb277bec05f56a0e0591f155a484cbd0f4f07ff2905051a48c72f004f7ed58"
++dependencies = [
++ "cipher",
++ "cpubits",
++ "cpufeatures 0.3.0",
++]
++
++[[package]]
++name = "aho-corasick"
++version = "1.1.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ddd31a130427c27518df266943a5308ed92d4b226cc639f5a8f1002816174301"
++dependencies = [
++ "memchr",
++]
++
++[[package]]
++name = "allocator-api2"
++version = "0.2.21"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
++
++[[package]]
++name = "android_system_properties"
++version = "0.1.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "819e7219dbd41043ac279b19830f2efc897156490d7fd6ea916720117ee66311"
++dependencies = [
++ "libc",
++]
++
++[[package]]
++name = "anyhow"
++version = "1.0.103"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
++
++[[package]]
++name = "arrayref"
++version = "0.3.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
++
++[[package]]
++name = "arrayvec"
++version = "0.7.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
++
++[[package]]
++name = "autocfg"
++version = "1.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
++
++[[package]]
++name = "base16ct"
++version = "1.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fd307490d624467aa6f74b0eabb77633d1f758a7b25f12bceb0b22e08d9726f6"
++
++[[package]]
++name = "base64"
++version = "0.22.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
++
++[[package]]
++name = "base64ct"
++version = "1.8.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
++
++[[package]]
++name = "bech32"
++version = "0.11.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
++
++[[package]]
++name = "bellman"
++version = "0.15.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "973b16549796a1274a63e00159a03250e66e8263e2ac6344b1c9fdfe9b7a8325"
++dependencies = [
++ "bitvec",
++ "blake2s_simd",
++ "byteorder",
++ "crossbeam-channel",
++ "ff",
++ "group",
++ "log",
++ "num_cpus",
++ "rand_core 0.10.1",
++ "rayon",
++ "subtle",
++]
++
++[[package]]
++name = "bip32"
++version = "0.6.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0271a2fe2a6f05231419e878b5f50152a5a6dbcc60c18855d924892ecc85a33a"
++dependencies = [
++ "bs58",
++ "hmac",
++ "ripemd 0.2.0",
++ "secp256k1",
++ "sha2 0.11.0",
++ "subtle",
++ "zeroize",
++]
++
++[[package]]
++name = "bitflags"
++version = "2.11.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
++
++[[package]]
++name = "bitflags-serde-legacy"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5b64e60c28b6d25ad92e8b367801ff9aa12b41d05fc8798055d296bace4a60cc"
++dependencies = [
++ "bitflags",
++ "serde",
++]
++
++[[package]]
++name = "bitvec"
++version = "1.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1bc2832c24239b0141d5674bb9174f9d68a8b5b3f2753311927c172ca46f7e9c"
++dependencies = [
++ "funty",
++ "radium",
++ "tap",
++ "wyz",
++]
++
++[[package]]
++name = "blake2b_simd"
++version = "1.0.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b79834656f71332577234b50bfc009996f7449e0c056884e6a02492ded0ca2f3"
++dependencies = [
++ "arrayref",
++ "arrayvec",
++ "constant_time_eq",
++]
++
++[[package]]
++name = "blake2s_simd"
++version = "1.0.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ee29928bad1e3f94c9d1528da29e07a1d3d04817ae8332de1e8b846c8439f4b3"
++dependencies = [
++ "arrayref",
++ "arrayvec",
++ "constant_time_eq",
++]
++
++[[package]]
++name = "block-buffer"
++version = "0.10.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
++dependencies = [
++ "generic-array",
++]
++
++[[package]]
++name = "block-buffer"
++version = "0.12.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
++dependencies = [
++ "hybrid-array",
++]
++
++[[package]]
++name = "bls12_381"
++version = "0.9.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "18f887f26229478dcd0e0d063566b51c68fb55a38fba21799c5f3371a74ec61f"
++dependencies = [
++ "ff",
++ "group",
++ "pairing",
++ "rand_core 0.10.1",
++ "subtle",
++ "zeroize",
++]
++
++[[package]]
++name = "bounded-vec"
++version = "0.9.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "09dc0086e469182132244e9b8d313a0742e1132da43a08c24b9dd3c18e0faf3a"
++dependencies = [
++ "serde",
++ "thiserror",
++]
++
++[[package]]
++name = "bs58"
++version = "0.5.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
++dependencies = [
++ "sha2 0.10.9",
++ "tinyvec",
++]
++
++[[package]]
++name = "bumpalo"
++version = "3.20.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
++
++[[package]]
++name = "byte-slice-cast"
++version = "1.2.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7575182f7272186991736b70173b0ea045398f984bf5ebbb3804736ce1330c9d"
++
++[[package]]
++name = "byteorder"
++version = "1.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
++
++[[package]]
++name = "bytes"
++version = "1.11.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
++
++[[package]]
++name = "cbc"
++version = "0.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ce2dc9ee5f88d11e0beb842c88b33c8a5cf0d1329c4b19494af42b07dbfe8896"
++dependencies = [
++ "cipher",
++]
++
++[[package]]
++name = "cc"
++version = "1.2.61"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d16d90359e986641506914ba71350897565610e87ce0ad9e6f28569db3dd5c6d"
++dependencies = [
++ "find-msvc-tools",
++ "shlex",
++]
++
++[[package]]
++name = "cfg-if"
++version = "1.0.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
++
++[[package]]
++name = "chacha20"
++version = "0.10.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
++dependencies = [
++ "cfg-if",
++ "cipher",
++ "cpufeatures 0.3.0",
++ "rand_core 0.10.1",
++]
++
++[[package]]
++name = "chacha20poly1305"
++version = "0.11.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9b89e1c441e926b9c82a8d023f6e1b7ae0adcfaa7d621814e4d60789bac751cb"
++dependencies = [
++ "aead",
++ "chacha20",
++ "cipher",
++ "poly1305",
++]
++
++[[package]]
++name = "chrono"
++version = "0.4.44"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
++dependencies = [
++ "iana-time-zone",
++ "num-traits",
++ "serde",
++ "windows-link",
++]
++
++[[package]]
++name = "cipher"
++version = "0.5.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e8cf2a2c93cd704877c0858356ed03480ff301ee950b43f1cbe4573b088bfa6c"
++dependencies = [
++ "block-buffer 0.12.1",
++ "crypto-common 0.2.2",
++ "inout",
++]
++
++[[package]]
++name = "cmov"
++version = "0.5.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
++
++[[package]]
++name = "const-oid"
++version = "0.10.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
++
++[[package]]
++name = "const_format"
++version = "0.2.36"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4481a617ad9a412be3b97c5d403fef8ed023103368908b9c50af598ff467cc1e"
++dependencies = [
++ "const_format_proc_macros",
++ "konst",
++]
++
++[[package]]
++name = "const_format_proc_macros"
++version = "0.2.34"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1d57c2eccfb16dbac1f4e61e206105db5820c9d26c3c472bc17c774259ef7744"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-xid",
++]
++
++[[package]]
++name = "constant_time_eq"
++version = "0.4.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
++
++[[package]]
++name = "core-foundation-sys"
++version = "0.8.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
++
++[[package]]
++name = "corez"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4df6f98652d30167eaeea34d77b730e07c8caba6df17bd4551842b9b8da01deb"
++
++[[package]]
++name = "cpubits"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "15b85f9c39137c3a891689859392b1bd49812121d0d61c9caf00d46ed5ce06ae"
++
++[[package]]
++name = "cpufeatures"
++version = "0.2.17"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
++dependencies = [
++ "libc",
++]
++
++[[package]]
++name = "cpufeatures"
++version = "0.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8b2a41393f66f16b0823bb79094d54ac5fbd34ab292ddafb9a0456ac9f87d201"
++dependencies = [
++ "libc",
++]
++
++[[package]]
++name = "crossbeam-channel"
++version = "0.5.15"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
++dependencies = [
++ "crossbeam-utils",
++]
++
++[[package]]
++name = "crossbeam-deque"
++version = "0.8.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9dd111b7b7f7d55b72c0a6ae361660ee5853c9af73f70c3c2ef6858b950e2e51"
++dependencies = [
++ "crossbeam-epoch",
++ "crossbeam-utils",
++]
++
++[[package]]
++name = "crossbeam-epoch"
++version = "0.9.20"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
++dependencies = [
++ "crossbeam-utils",
++]
++
++[[package]]
++name = "crossbeam-utils"
++version = "0.8.21"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
++
++[[package]]
++name = "crunchy"
++version = "0.2.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
++
++[[package]]
++name = "crypto-common"
++version = "0.1.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
++dependencies = [
++ "generic-array",
++ "typenum",
++]
++
++[[package]]
++name = "crypto-common"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
++dependencies = [
++ "hybrid-array",
++]
++
++[[package]]
++name = "ctutils"
++version = "0.4.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
++dependencies = [
++ "cmov",
++]
++
++[[package]]
++name = "curve25519-dalek"
++version = "5.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b5eed333089e2e1c1ac8c6c0398e5e2497b4c9926ca6d0365ed1e099afa5bc23"
++dependencies = [
++ "cfg-if",
++ "cpufeatures 0.3.0",
++ "curve25519-dalek-derive",
++ "digest 0.11.3",
++ "fiat-crypto",
++ "rustc_version",
++ "serde",
++ "subtle",
++ "zeroize",
++]
++
++[[package]]
++name = "curve25519-dalek-derive"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f46882e17999c6cc590af592290432be3bce0428cb0d5f8b6715e4dc7b383eb3"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "darling"
++version = "0.23.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "25ae13da2f202d56bd7f91c25fba009e7717a1e4a1cc98a76d844b65ae912e9d"
++dependencies = [
++ "darling_core",
++ "darling_macro",
++]
++
++[[package]]
++name = "darling_core"
++version = "0.23.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9865a50f7c335f53564bb694ef660825eb8610e0a53d3e11bf1b0d3df31e03b0"
++dependencies = [
++ "ident_case",
++ "proc-macro2",
++ "quote",
++ "strsim",
++ "syn",
++]
++
++[[package]]
++name = "darling_macro"
++version = "0.23.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ac3984ec7bd6cfa798e62b4a642426a5be0e68f9401cfc2a01e3fa9ea2fcdb8d"
++dependencies = [
++ "darling_core",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "der"
++version = "0.8.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a878c850e9e421b20262e9b41f9c860e4785fa07541c266b62ff9d1ef998a80a"
++dependencies = [
++ "const-oid",
++ "pem-rfc7468",
++ "zeroize",
++]
++
++[[package]]
++name = "deranged"
++version = "0.5.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
++dependencies = [
++ "powerfmt",
++ "serde_core",
++]
++
++[[package]]
++name = "derive-getters"
++version = "0.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "74ef43543e701c01ad77d3a5922755c6a1d71b22d942cb8042be4994b380caff"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "digest"
++version = "0.10.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
++dependencies = [
++ "block-buffer 0.10.4",
++ "crypto-common 0.1.7",
++]
++
++[[package]]
++name = "digest"
++version = "0.11.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
++dependencies = [
++ "block-buffer 0.12.1",
++ "crypto-common 0.2.2",
++ "ctutils",
++]
++
++[[package]]
++name = "dirs"
++version = "6.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
++dependencies = [
++ "dirs-sys",
++]
++
++[[package]]
++name = "dirs-sys"
++version = "0.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
++dependencies = [
++ "libc",
++ "option-ext",
++ "redox_users",
++ "windows-sys",
++]
++
++[[package]]
++name = "document-features"
++version = "0.2.12"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
++dependencies = [
++ "litrs",
++]
++
++[[package]]
++name = "dyn-clone"
++version = "1.0.20"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
++
++[[package]]
++name = "ed25519"
++version = "3.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "29fcf32e6c73d1079f83ab4d782de2d81620346a5f38c6237a86a22f8368980a"
++dependencies = [
++ "pkcs8",
++ "serdect",
++ "signature",
++]
++
++[[package]]
++name = "ed25519-zebra"
++version = "5.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "aa764ad1bb0a84aaed1575b6d426ce927f610225bd9aeee88d02e08a6fea8215"
++dependencies = [
++ "curve25519-dalek",
++ "ed25519",
++ "hashbrown 0.16.1",
++ "pkcs8",
++ "rand_core 0.10.1",
++ "serde",
++ "sha2 0.11.0",
++ "subtle",
++ "zeroize",
++]
++
++[[package]]
++name = "either"
++version = "1.15.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
++
++[[package]]
++name = "equihash"
++version = "0.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "306286e8dcc39ab3dfceb74c792ce8baffdab90591321d3ffaae64829734c37f"
++dependencies = [
++ "blake2b_simd",
++ "corez",
++ "document-features",
++]
++
++[[package]]
++name = "equivalent"
++version = "1.0.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
++
++[[package]]
++name = "errno"
++version = "0.3.14"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
++dependencies = [
++ "libc",
++ "windows-sys",
++]
++
++[[package]]
++name = "f4jumble"
++version = "0.1.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2cae5503f6dc8629246d7e9b3450d3712e5be20f2ed7f9fb6b67212a4f315adc"
++dependencies = [
++ "blake2b_simd",
++]
++
++[[package]]
++name = "fastrand"
++version = "2.4.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
++
++[[package]]
++name = "ff"
++version = "0.14.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a1f686ab92a9fb0eaf188f6c6c87b89490baa6fdb0db4544ba4dc47f7942489f"
++dependencies = [
++ "bitvec",
++ "ff_derive",
++ "rand_core 0.10.1",
++ "subtle",
++]
++
++[[package]]
++name = "ff_derive"
++version = "0.14.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "241afe8c15ffa21933eaefe8a563af36fd9fc98a3e8a044e8f7db52eb1fae3d8"
++dependencies = [
++ "addchain",
++ "num-bigint 0.4.6",
++ "num-integer",
++ "num-traits",
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "fiat-crypto"
++version = "0.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
++
++[[package]]
++name = "find-msvc-tools"
++version = "0.1.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
++
++[[package]]
++name = "fixed-hash"
++version = "0.8.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "835c052cb0c08c1acf6ffd71c022172e18723949c8282f2b9f27efbc51e64534"
++dependencies = [
++ "byteorder",
++ "rand 0.8.6",
++ "rustc-hex",
++ "static_assertions",
++]
++
++[[package]]
++name = "foldhash"
++version = "0.1.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
++
++[[package]]
++name = "foldhash"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
++
++[[package]]
++name = "fpe"
++version = "0.7.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5045d51a6a5e85e0a18d909eedd270c4d82ad634fee57ba707692fb3b1add5a7"
++dependencies = [
++ "cbc",
++ "cipher",
++ "libm",
++ "num-bigint 0.5.1",
++ "num-integer",
++ "num-traits",
++]
++
++[[package]]
++name = "funty"
++version = "2.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
++
++[[package]]
++name = "futures"
++version = "0.3.32"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8b147ee9d1f6d097cef9ce628cd2ee62288d963e16fb287bd9286455b241382d"
++dependencies = [
++ "futures-channel",
++ "futures-core",
++ "futures-executor",
++ "futures-io",
++ "futures-sink",
++ "futures-task",
++ "futures-util",
++]
++
++[[package]]
++name = "futures-channel"
++version = "0.3.32"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "07bbe89c50d7a535e539b8c17bc0b49bdb77747034daa8087407d655f3f7cc1d"
++dependencies = [
++ "futures-core",
++ "futures-sink",
++]
++
++[[package]]
++name = "futures-core"
++version = "0.3.32"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
++
++[[package]]
++name = "futures-executor"
++version = "0.3.32"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "baf29c38818342a3b26b5b923639e7b1f4a61fc5e76102d4b1981c6dc7a7579d"
++dependencies = [
++ "futures-core",
++ "futures-task",
++ "futures-util",
++]
++
++[[package]]
++name = "futures-io"
++version = "0.3.32"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cecba35d7ad927e23624b22ad55235f2239cfa44fd10428eecbeba6d6a717718"
++
++[[package]]
++name = "futures-macro"
++version = "0.3.32"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e835b70203e41293343137df5c0664546da5745f82ec9b84d40be8336958447b"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "futures-sink"
++version = "0.3.32"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c39754e157331b013978ec91992bde1ac089843443c49cbc7f46150b0fad0893"
++
++[[package]]
++name = "futures-task"
++version = "0.3.32"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "037711b3d59c33004d3856fbdc83b99d4ff37a24768fa1be9ce3538a1cde4393"
++
++[[package]]
++name = "futures-util"
++version = "0.3.32"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
++dependencies = [
++ "futures-channel",
++ "futures-core",
++ "futures-io",
++ "futures-macro",
++ "futures-sink",
++ "futures-task",
++ "memchr",
++ "pin-project-lite",
++ "slab",
++]
++
++[[package]]
++name = "generic-array"
++version = "0.14.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
++dependencies = [
++ "typenum",
++ "version_check",
++]
++
++[[package]]
++name = "getrandom"
++version = "0.2.17"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
++dependencies = [
++ "cfg-if",
++ "libc",
++ "wasi",
++]
++
++[[package]]
++name = "getrandom"
++version = "0.3.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
++dependencies = [
++ "cfg-if",
++ "libc",
++ "r-efi 5.3.0",
++ "wasip2",
++]
++
++[[package]]
++name = "getrandom"
++version = "0.4.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0de51e6874e94e7bf76d726fc5d13ba782deca734ff60d5bb2fb2607c7406555"
++dependencies = [
++ "cfg-if",
++ "libc",
++ "r-efi 6.0.0",
++ "rand_core 0.10.1",
++ "wasip2",
++ "wasip3",
++]
++
++[[package]]
++name = "getset"
++version = "0.1.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9cf0fc11e47561d47397154977bc219f4cf809b2974facc3ccb3b89e2436f912"
++dependencies = [
++ "proc-macro-error2",
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "groth16"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8bb1e0bde2dbacd81474ae216c5dd4901307bd1c75fd26ed49590e88048c8442"
++dependencies = [
++ "bellman",
++ "byteorder",
++ "ff",
++ "group",
++ "pairing",
++ "rand 0.10.2",
++ "rand_core 0.10.1",
++ "rayon",
++]
++
++[[package]]
++name = "group"
++version = "0.14.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7fd1a1c7a5206c5b7a3f5a0d7ccd3ff85d0c8f5133d62a02680255b0004af5f4"
++dependencies = [
++ "ff",
++ "memuse",
++ "rand_core 0.10.1",
++ "subtle",
++]
++
++[[package]]
++name = "halo2_gadgets"
++version = "0.6.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8862c7f2d99964760016516103fcc621352e77a505b22b0fc25140f09e4b8bb0"
++dependencies = [
++ "arrayvec",
++ "bitvec",
++ "ff",
++ "group",
++ "halo2_poseidon",
++ "halo2_proofs",
++ "pasta_curves",
++ "rand 0.10.2",
++ "sinsemilla",
++ "subtle",
++ "uint 0.9.5",
++]
++
++[[package]]
++name = "halo2_legacy_pdqsort"
++version = "0.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "47716fe1ae67969c5e0b2ef826f32db8c3be72be325e1aa3c1951d06b5575ec5"
++
++[[package]]
++name = "halo2_poseidon"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "800f76fa421515e2729192e3863bb0a58f30fe17a9a165ea5e778a157adeb579"
++dependencies = [
++ "bitvec",
++ "ff",
++ "group",
++ "pasta_curves",
++]
++
++[[package]]
++name = "halo2_proofs"
++version = "0.4.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f5af2a9457f494f862cd07b81c2e98a19f50b06a2057b7569450d7c26b167d1c"
++dependencies = [
++ "blake2b_simd",
++ "ff",
++ "group",
++ "halo2_legacy_pdqsort",
++ "indexmap 2.14.0",
++ "maybe-rayon",
++ "pasta_curves",
++ "rand 0.10.2",
++ "rand_core 0.10.1",
++ "tracing",
++]
++
++[[package]]
++name = "hashbrown"
++version = "0.12.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8a9ee70c43aaf417c914396645a0fa852624801b24ebb7ae78fe8272889ac888"
++
++[[package]]
++name = "hashbrown"
++version = "0.15.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
++dependencies = [
++ "foldhash 0.1.5",
++]
++
++[[package]]
++name = "hashbrown"
++version = "0.16.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
++dependencies = [
++ "allocator-api2",
++ "equivalent",
++ "foldhash 0.2.0",
++]
++
++[[package]]
++name = "hashbrown"
++version = "0.17.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
++
++[[package]]
++name = "heck"
++version = "0.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
++
++[[package]]
++name = "hermit-abi"
++version = "0.5.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
++
++[[package]]
++name = "hex"
++version = "0.4.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
++dependencies = [
++ "serde",
++]
++
++[[package]]
++name = "hmac"
++version = "0.13.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
++dependencies = [
++ "digest 0.11.3",
++]
++
++[[package]]
++name = "humantime"
++version = "2.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "135b12329e5e3ce057a9f972339ea52bc954fe1e9358ef27f95e89716fbc5424"
++
++[[package]]
++name = "humantime-serde"
++version = "1.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "57a3db5ea5923d99402c94e9feb261dc5ee9b4efa158b0315f788cf549cc200c"
++dependencies = [
++ "humantime",
++ "serde",
++]
++
++[[package]]
++name = "hybrid-array"
++version = "0.4.15"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"
++dependencies = [
++ "typenum",
++]
++
++[[package]]
++name = "iana-time-zone"
++version = "0.1.65"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e31bc9ad994ba00e440a8aa5c9ef0ec67d5cb5e5cb0cc7f8b744a35b389cc470"
++dependencies = [
++ "android_system_properties",
++ "core-foundation-sys",
++ "iana-time-zone-haiku",
++ "js-sys",
++ "log",
++ "wasm-bindgen",
++ "windows-core",
++]
++
++[[package]]
++name = "iana-time-zone-haiku"
++version = "0.1.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
++dependencies = [
++ "cc",
++]
++
++[[package]]
++name = "id-arena"
++version = "2.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
++
++[[package]]
++name = "ident_case"
++version = "1.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
++
++[[package]]
++name = "impl-codec"
++version = "0.6.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ba6a270039626615617f3f36d15fc827041df3b78c439da2cadfa47455a77f2f"
++dependencies = [
++ "parity-scale-codec",
++]
++
++[[package]]
++name = "impl-trait-for-tuples"
++version = "0.2.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a0eb5a3343abf848c0984fe4604b2b105da9539376e24fc0a3b0007411ae4fd9"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "incrementalmerkletree"
++version = "0.9.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c3b0c166f7f34e02988f84a7bed22be9707b1569acc6aeb3afaf34152d0e0400"
++dependencies = [
++ "either",
++]
++
++[[package]]
++name = "indexmap"
++version = "1.9.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "bd070e393353796e801d209ad339e89596eb4c8d430d18ede6a1cced8fafbd99"
++dependencies = [
++ "autocfg",
++ "hashbrown 0.12.3",
++ "serde",
++]
++
++[[package]]
++name = "indexmap"
++version = "2.14.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
++dependencies = [
++ "equivalent",
++ "hashbrown 0.17.0",
++ "serde",
++ "serde_core",
++]
++
++[[package]]
++name = "inout"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
++dependencies = [
++ "hybrid-array",
++]
++
++[[package]]
++name = "itertools"
++version = "0.14.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
++dependencies = [
++ "either",
++]
++
++[[package]]
++name = "itoa"
++version = "1.0.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
++
++[[package]]
++name = "js-sys"
++version = "0.3.97"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a1840c94c045fbcf8ba2812c95db44499f7c64910a912551aaaa541decebcacf"
++dependencies = [
++ "cfg-if",
++ "futures-util",
++ "once_cell",
++ "wasm-bindgen",
++]
++
++[[package]]
++name = "jubjub"
++version = "0.11.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "95fdd9a071f72385ed8b17d819f273d73c3887a93d34d2ac1419fca5b25dbbd2"
++dependencies = [
++ "bitvec",
++ "bls12_381",
++ "ff",
++ "group",
++ "rand_core 0.10.1",
++ "subtle",
++ "zeroize",
++]
++
++[[package]]
++name = "konst"
++version = "0.2.20"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "128133ed7824fcd73d6e7b17957c5eb7bacb885649bd8c69708b2331a10bcefb"
++dependencies = [
++ "konst_macro_rules",
++]
++
++[[package]]
++name = "konst_macro_rules"
++version = "0.2.19"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
++
++[[package]]
++name = "lazy_static"
++version = "1.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
++dependencies = [
++ "spin",
++]
++
++[[package]]
++name = "leb128fmt"
++version = "0.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
++
++[[package]]
++name = "libc"
++version = "0.2.186"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
++
++[[package]]
++name = "libm"
++version = "0.2.16"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
++
++[[package]]
++name = "libredox"
++version = "0.1.16"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e02f3bb43d335493c96bf3fd3a321600bf6bd07ed34bc64118e9293bdffea46c"
++dependencies = [
++ "libc",
++]
++
++[[package]]
++name = "linux-raw-sys"
++version = "0.12.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
++
++[[package]]
++name = "litrs"
++version = "1.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
++
++[[package]]
++name = "lock_api"
++version = "0.4.14"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
++dependencies = [
++ "scopeguard",
++]
++
++[[package]]
++name = "log"
++version = "0.4.29"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
++
++[[package]]
++name = "matchers"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
++dependencies = [
++ "regex-automata",
++]
++
++[[package]]
++name = "maybe-rayon"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8ea1f30cedd69f0a2954655f7188c6a834246d2bcf1e315e2ac40c4b24dc9519"
++dependencies = [
++ "cfg-if",
++ "rayon",
++]
++
++[[package]]
++name = "memchr"
++version = "2.8.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
++
++[[package]]
++name = "memuse"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3d97bbf43eb4f088f8ca469930cde17fa036207c9a5e02ccc5107c4e8b17c964"
++
++[[package]]
++name = "metrics"
++version = "0.24.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "89550ee9f79e88fef3119de263694973a8adb26c21d75322164fb8c493039fe2"
++dependencies = [
++ "portable-atomic",
++ "rapidhash",
++]
++
++[[package]]
++name = "mio"
++version = "1.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "50b7e5b27aa02a74bac8c3f23f448f8d87ff11f92d3aac1a6ed369ee08cc56c1"
++dependencies = [
++ "libc",
++ "wasi",
++ "windows-sys",
++]
++
++[[package]]
++name = "mset"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "26c4d16a3d2b0e89ec6e7d509cf791545fcb48cbc8fc2fb2e96a492defda9140"
++
++[[package]]
++name = "nonempty"
++version = "0.11.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "549e471b99ccaf2f89101bec68f4d244457d5a95a9c3d0672e9564124397741d"
++
++[[package]]
++name = "nu-ansi-term"
++version = "0.50.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
++dependencies = [
++ "windows-sys",
++]
++
++[[package]]
++name = "num-bigint"
++version = "0.4.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
++dependencies = [
++ "num-integer",
++ "num-traits",
++]
++
++[[package]]
++name = "num-bigint"
++version = "0.5.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "93e7820bc0a80a0238e650327316f929ba18d5be054b647490a3a6a339f3e7c0"
++dependencies = [
++ "num-integer",
++ "num-traits",
++]
++
++[[package]]
++name = "num-conv"
++version = "0.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c6673768db2d862beb9b39a78fdcb1a69439615d5794a1be50caa9bc92c81967"
++
++[[package]]
++name = "num-integer"
++version = "0.1.46"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7969661fd2958a5cb096e56c8e1ad0444ac2bbcd0061bd28660485a44879858f"
++dependencies = [
++ "num-traits",
++]
++
++[[package]]
++name = "num-traits"
++version = "0.2.19"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
++dependencies = [
++ "autocfg",
++]
++
++[[package]]
++name = "num_cpus"
++version = "1.17.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
++dependencies = [
++ "hermit-abi",
++ "libc",
++]
++
++[[package]]
++name = "once_cell"
++version = "1.21.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
++
++[[package]]
++name = "option-ext"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
++
++[[package]]
++name = "orchard"
++version = "0.16.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4ae7ceb7b5387bd76cf3c0712f57708795c925cecf097036cedb60b5c3706e8f"
++dependencies = [
++ "aes",
++ "bitvec",
++ "blake2b_simd",
++ "corez",
++ "ff",
++ "fpe",
++ "getset",
++ "group",
++ "halo2_gadgets",
++ "halo2_poseidon",
++ "halo2_proofs",
++ "hex",
++ "incrementalmerkletree",
++ "lazy_static",
++ "memuse",
++ "nonempty",
++ "pasta_curves",
++ "rand 0.10.2",
++ "rand_core 0.10.1",
++ "reddsa",
++ "serde",
++ "sinsemilla",
++ "subtle",
++ "tracing",
++ "visibility",
++ "zcash_note_encryption",
++ "zcash_spec",
++ "zeroize",
++ "zip32",
++]
++
++[[package]]
++name = "pairing"
++version = "0.24.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "33f6413397336802d16a342e69a5bd9c8b8cc2fa9fc9298044cd3443f77f1010"
++dependencies = [
++ "group",
++]
++
++[[package]]
++name = "parity-scale-codec"
++version = "3.7.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "799781ae679d79a948e13d4824a40970bfa500058d245760dd857301059810fa"
++dependencies = [
++ "arrayvec",
++ "bitvec",
++ "byte-slice-cast",
++ "const_format",
++ "impl-trait-for-tuples",
++ "parity-scale-codec-derive",
++ "rustversion",
++ "serde",
++]
++
++[[package]]
++name = "parity-scale-codec-derive"
++version = "3.7.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "34b4653168b563151153c9e4c08ebed57fb8262bebfa79711552fa983c623e7a"
++dependencies = [
++ "proc-macro-crate",
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "parking_lot"
++version = "0.12.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
++dependencies = [
++ "lock_api",
++ "parking_lot_core",
++]
++
++[[package]]
++name = "parking_lot_core"
++version = "0.9.12"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
++dependencies = [
++ "cfg-if",
++ "libc",
++ "redox_syscall",
++ "smallvec",
++ "windows-link",
++]
++
++[[package]]
++name = "pasta_curves"
++version = "0.6.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a0ed53ba43531a06e1f82020907cf192fc3c25d7c0baf5c49c547b74e7103b62"
++dependencies = [
++ "blake2b_simd",
++ "ff",
++ "group",
++ "lazy_static",
++ "rand 0.10.2",
++ "static_assertions",
++ "subtle",
++ "zeroize",
++]
++
++[[package]]
++name = "pem-rfc7468"
++version = "1.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a6305423e0e7738146434843d1694d621cce767262b2a86910beab705e4493d9"
++dependencies = [
++ "base64ct",
++]
++
++[[package]]
++name = "pin-project"
++version = "1.1.11"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f1749c7ed4bcaf4c3d0a3efc28538844fb29bcdd7d2b67b2be7e20ba861ff517"
++dependencies = [
++ "pin-project-internal",
++]
++
++[[package]]
++name = "pin-project-internal"
++version = "1.1.11"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d9b20ed30f105399776b9c883e68e536ef602a16ae6f596d2c473591d6ad64c6"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "pin-project-lite"
++version = "0.2.17"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
++
++[[package]]
++name = "pkcs8"
++version = "0.11.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "451913da69c775a56034ea8d9003d27ee8948e12443eae7c038ba100a4f21cb7"
++dependencies = [
++ "der",
++ "spki",
++]
++
++[[package]]
++name = "poly1305"
++version = "0.9.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6e2d0073b297041425c7c3df6eb4792d598a15323fe63346852b092eca02904c"
++dependencies = [
++ "cpufeatures 0.3.0",
++ "universal-hash",
++]
++
++[[package]]
++name = "portable-atomic"
++version = "1.13.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
++
++[[package]]
++name = "powerfmt"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
++
++[[package]]
++name = "ppv-lite86"
++version = "0.2.21"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
++dependencies = [
++ "zerocopy",
++]
++
++[[package]]
++name = "prettyplease"
++version = "0.2.37"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
++dependencies = [
++ "proc-macro2",
++ "syn",
++]
++
++[[package]]
++name = "primitive-types"
++version = "0.12.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0b34d9fd68ae0b74a41b21c03c2f62847aa0ffea044eee893b4c140b37e244e2"
++dependencies = [
++ "fixed-hash",
++ "impl-codec",
++ "uint 0.9.5",
++]
++
++[[package]]
++name = "proc-macro-crate"
++version = "3.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
++dependencies = [
++ "toml_edit",
++]
++
++[[package]]
++name = "proc-macro-error-attr2"
++version = "2.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "96de42df36bb9bba5542fe9f1a054b8cc87e172759a1868aa05c1f3acc89dfc5"
++dependencies = [
++ "proc-macro2",
++ "quote",
++]
++
++[[package]]
++name = "proc-macro-error2"
++version = "2.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "11ec05c52be0a07b08061f7dd003e7d7092e0472bc731b4af7bb1ef876109802"
++dependencies = [
++ "proc-macro-error-attr2",
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "proc-macro2"
++version = "1.0.106"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
++dependencies = [
++ "unicode-ident",
++]
++
++[[package]]
++name = "quote"
++version = "1.0.45"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
++dependencies = [
++ "proc-macro2",
++]
++
++[[package]]
++name = "r-efi"
++version = "5.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
++
++[[package]]
++name = "r-efi"
++version = "6.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
++
++[[package]]
++name = "radium"
++version = "0.7.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
++
++[[package]]
++name = "rand"
++version = "0.8.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5ca0ecfa931c29007047d1bc58e623ab12e5590e8c7cc53200d5202b69266d8a"
++dependencies = [
++ "libc",
++ "rand_chacha 0.3.1",
++ "rand_core 0.6.4",
++]
++
++[[package]]
++name = "rand"
++version = "0.9.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "44c5af06bb1b7d3216d91932aed5265164bf384dc89cd6ba05cf59a35f5f76ea"
++dependencies = [
++ "rand_chacha 0.9.0",
++ "rand_core 0.9.5",
++]
++
++[[package]]
++name = "rand"
++version = "0.10.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
++dependencies = [
++ "chacha20",
++ "getrandom 0.4.2",
++ "rand_core 0.10.1",
++]
++
++[[package]]
++name = "rand_chacha"
++version = "0.3.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e6c10a63a0fa32252be49d21e7709d4d4baf8d231c2dbce1eaa8141b9b127d88"
++dependencies = [
++ "ppv-lite86",
++ "rand_core 0.6.4",
++]
++
++[[package]]
++name = "rand_chacha"
++version = "0.9.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
++dependencies = [
++ "ppv-lite86",
++ "rand_core 0.9.5",
++]
++
++[[package]]
++name = "rand_core"
++version = "0.6.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
++dependencies = [
++ "getrandom 0.2.17",
++]
++
++[[package]]
++name = "rand_core"
++version = "0.9.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
++dependencies = [
++ "getrandom 0.3.4",
++]
++
++[[package]]
++name = "rand_core"
++version = "0.10.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
++
++[[package]]
++name = "rapidhash"
++version = "4.4.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b5e48930979c155e2f33aa36ab3119b5ee81332beb6482199a8ecd6029b80b59"
++dependencies = [
++ "rustversion",
++]
++
++[[package]]
++name = "rayon"
++version = "1.12.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
++dependencies = [
++ "either",
++ "rayon-core",
++]
++
++[[package]]
++name = "rayon-core"
++version = "1.13.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
++dependencies = [
++ "crossbeam-deque",
++ "crossbeam-utils",
++]
++
++[[package]]
++name = "reddsa"
++version = "0.6.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4a70b6dbd7b3277cbd4d89ee750a30bebab3b9951ee4e166ce15c00975fe410f"
++dependencies = [
++ "blake2b_simd",
++ "byteorder",
++ "group",
++ "hex",
++ "jubjub",
++ "pasta_curves",
++ "rand_core 0.10.1",
++ "serde",
++ "thiserror",
++ "zeroize",
++]
++
++[[package]]
++name = "redjubjub"
++version = "0.9.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "19ff57b3369b472353110bea305ced2612a1380e2d2079dd26c200ed42064421"
++dependencies = [
++ "rand_core 0.10.1",
++ "reddsa",
++ "serde",
++ "thiserror",
++ "zeroize",
++]
++
++[[package]]
++name = "redox_syscall"
++version = "0.5.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
++dependencies = [
++ "bitflags",
++]
++
++[[package]]
++name = "redox_users"
++version = "0.5.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
++dependencies = [
++ "getrandom 0.2.17",
++ "libredox",
++ "thiserror",
++]
++
++[[package]]
++name = "ref-cast"
++version = "1.0.25"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f354300ae66f76f1c85c5f84693f0ce81d747e2c3f21a45fef496d89c960bf7d"
++dependencies = [
++ "ref-cast-impl",
++]
++
++[[package]]
++name = "ref-cast-impl"
++version = "1.0.25"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b7186006dcb21920990093f30e3dea63b7d6e977bf1256be20c3563a5db070da"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "regex"
++version = "1.12.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e10754a14b9137dd7b1e3e5b0493cc9171fdd105e0ab477f51b72e7f3ac0e276"
++dependencies = [
++ "aho-corasick",
++ "memchr",
++ "regex-automata",
++ "regex-syntax",
++]
++
++[[package]]
++name = "regex-automata"
++version = "0.4.14"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6e1dd4122fc1595e8162618945476892eefca7b88c52820e74af6262213cae8f"
++dependencies = [
++ "aho-corasick",
++ "memchr",
++ "regex-syntax",
++]
++
++[[package]]
++name = "regex-syntax"
++version = "0.8.10"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
++
++[[package]]
++name = "ripemd"
++version = "0.1.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "bd124222d17ad93a644ed9d011a40f4fb64aa54275c08cc216524a9ea82fb09f"
++dependencies = [
++ "digest 0.10.7",
++]
++
++[[package]]
++name = "ripemd"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4dd4211456b4172d7e44261920c25acf07367c4f04bb5f5d54fc21b090d9b159"
++dependencies = [
++ "digest 0.11.3",
++]
++
++[[package]]
++name = "rustc-hex"
++version = "2.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3e75f6a532d0fd9f7f13144f392b6ad56a32696bfcd9c78f797f16bbb6f072d6"
++
++[[package]]
++name = "rustc_version"
++version = "0.4.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
++dependencies = [
++ "semver",
++]
++
++[[package]]
++name = "rustix"
++version = "1.1.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
++dependencies = [
++ "bitflags",
++ "errno",
++ "libc",
++ "linux-raw-sys",
++ "windows-sys",
++]
++
++[[package]]
++name = "rustversion"
++version = "1.0.22"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
++
++[[package]]
++name = "sapling-crypto"
++version = "0.9.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4a2cbdcfeef20006adf72699cd466f21fe349674277cc05d3fc9b7302db7b182"
++dependencies = [
++ "aes",
++ "bellman",
++ "bitvec",
++ "blake2b_simd",
++ "blake2s_simd",
++ "bls12_381",
++ "corez",
++ "document-features",
++ "ff",
++ "fpe",
++ "getset",
++ "groth16",
++ "group",
++ "hex",
++ "incrementalmerkletree",
++ "jubjub",
++ "lazy_static",
++ "memuse",
++ "rand 0.10.2",
++ "rand_core 0.10.1",
++ "redjubjub",
++ "subtle",
++ "tracing",
++ "zcash_note_encryption",
++ "zcash_spec",
++ "zeroize",
++ "zip32",
++]
++
++[[package]]
++name = "schemars"
++version = "0.9.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4cd191f9397d57d581cddd31014772520aa448f65ef991055d7f61582c65165f"
++dependencies = [
++ "dyn-clone",
++ "ref-cast",
++ "serde",
++ "serde_json",
++]
++
++[[package]]
++name = "schemars"
++version = "1.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a2b42f36aa1cd011945615b92222f6bf73c599a102a300334cd7f8dbeec726cc"
++dependencies = [
++ "dyn-clone",
++ "ref-cast",
++ "schemars_derive",
++ "serde",
++ "serde_json",
++]
++
++[[package]]
++name = "schemars_derive"
++version = "1.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7d115b50f4aaeea07e79c1912f645c7513d81715d0420f8bc77a18c6260b307f"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "serde_derive_internals",
++ "syn",
++]
++
++[[package]]
++name = "scopeguard"
++version = "1.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
++
++[[package]]
++name = "secp256k1"
++version = "0.33.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d7f404a8dab7a7a5a631e741d8699aa9c8e1d689fc26ccf897c7187565490b69"
++dependencies = [
++ "rand 0.9.4",
++ "secp256k1-sys",
++ "serde",
++]
++
++[[package]]
++name = "secp256k1-sys"
++version = "0.14.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f6b2992d4a3cd244539a7d5d0966aadbe5ca7fb868a5d7e38c29499b9e709bbd"
++dependencies = [
++ "cc",
++]
++
++[[package]]
++name = "semver"
++version = "1.0.28"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
++
++[[package]]
++name = "serde"
++version = "1.0.228"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
++dependencies = [
++ "serde_core",
++ "serde_derive",
++]
++
++[[package]]
++name = "serde-big-array"
++version = "0.5.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "11fc7cc2c76d73e0f27ee52abbd64eec84d46f370c88371120433196934e4b7f"
++dependencies = [
++ "serde",
++]
++
++[[package]]
++name = "serde_core"
++version = "1.0.228"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "41d385c7d4ca58e59fc732af25c3983b67ac852c1a25000afe1175de458b67ad"
++dependencies = [
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_derive"
++version = "1.0.228"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "serde_derive_internals"
++version = "0.29.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "18d26a20a969b9e3fdf2fc2d9f21eda6c40e2de84c9408bb5d3b05d499aae711"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "serde_json"
++version = "1.0.149"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
++dependencies = [
++ "itoa",
++ "memchr",
++ "serde",
++ "serde_core",
++ "zmij",
++]
++
++[[package]]
++name = "serde_with"
++version = "3.21.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "76a5c54c7310e7b8b9577c286d7e399ddd876c3e12b3ed917a8aabc4b96e9e8c"
++dependencies = [
++ "base64",
++ "bs58",
++ "chrono",
++ "hex",
++ "indexmap 1.9.3",
++ "indexmap 2.14.0",
++ "schemars 0.9.0",
++ "schemars 1.2.1",
++ "serde_core",
++ "serde_json",
++ "serde_with_macros",
++ "time",
++]
++
++[[package]]
++name = "serde_with_macros"
++version = "3.21.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "84d57bc0c8b9a17920c178daa6bb924850d54a9c97ab45194bb8c17ad66bb660"
++dependencies = [
++ "darling",
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "serdect"
++version = "0.4.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "66cf8fedced2fcf12406bcb34223dffb92eaf34908ede12fed414c82b7f00b3e"
++dependencies = [
++ "base16ct",
++ "serde",
++]
++
++[[package]]
++name = "sha1"
++version = "0.10.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
++dependencies = [
++ "cfg-if",
++ "cpufeatures 0.2.17",
++ "digest 0.10.7",
++]
++
++[[package]]
++name = "sha2"
++version = "0.10.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
++dependencies = [
++ "cfg-if",
++ "cpufeatures 0.2.17",
++ "digest 0.10.7",
++]
++
++[[package]]
++name = "sha2"
++version = "0.11.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
++dependencies = [
++ "cfg-if",
++ "cpufeatures 0.3.0",
++ "digest 0.11.3",
++]
++
++[[package]]
++name = "sharded-slab"
++version = "0.1.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
++dependencies = [
++ "lazy_static",
++]
++
++[[package]]
++name = "shlex"
++version = "1.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
++
++[[package]]
++name = "signal-hook-registry"
++version = "1.4.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
++dependencies = [
++ "errno",
++ "libc",
++]
++
++[[package]]
++name = "signature"
++version = "3.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
++
++[[package]]
++name = "sinsemilla"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "72744738b764bb3bb7bb5dcf71b62d19c2de8a09f850a7388f6088f244037299"
++dependencies = [
++ "group",
++ "pasta_curves",
++ "subtle",
++]
++
++[[package]]
++name = "slab"
++version = "0.4.12"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
++
++[[package]]
++name = "smallvec"
++version = "1.15.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
++
++[[package]]
++name = "socket2"
++version = "0.6.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
++dependencies = [
++ "libc",
++ "windows-sys",
++]
++
++[[package]]
++name = "spin"
++version = "0.9.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
++
++[[package]]
++name = "spki"
++version = "0.8.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1d9efca8738c78ee9484207732f728b1ef517bbb1833d6fc0879ca898a522f6f"
++dependencies = [
++ "base64ct",
++ "der",
++]
++
++[[package]]
++name = "static_assertions"
++version = "1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
++
++[[package]]
++name = "strsim"
++version = "0.11.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
++
++[[package]]
++name = "strum"
++version = "0.27.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
++dependencies = [
++ "strum_macros",
++]
++
++[[package]]
++name = "strum_macros"
++version = "0.27.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7695ce3845ea4b33927c055a39dc438a45b059f7c1b3d91d38d10355fb8cbca7"
++dependencies = [
++ "heck",
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "subtle"
++version = "2.6.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
++
++[[package]]
++name = "syn"
++version = "2.0.117"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e665b8803e7b1d2a727f4023456bbbbe74da67099c585258af0ad9c5013b9b99"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "tap"
++version = "1.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
++
++[[package]]
++name = "tempfile"
++version = "3.27.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
++dependencies = [
++ "fastrand",
++ "getrandom 0.4.2",
++ "once_cell",
++ "rustix",
++ "windows-sys",
++]
++
++[[package]]
++name = "thiserror"
++version = "2.0.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
++dependencies = [
++ "thiserror-impl",
++]
++
++[[package]]
++name = "thiserror-impl"
++version = "2.0.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "thread_local"
++version = "1.1.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
++dependencies = [
++ "cfg-if",
++]
++
++[[package]]
++name = "time"
++version = "0.3.47"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "743bd48c283afc0388f9b8827b976905fb217ad9e647fae3a379a9283c4def2c"
++dependencies = [
++ "deranged",
++ "itoa",
++ "num-conv",
++ "powerfmt",
++ "serde_core",
++ "time-core",
++ "time-macros",
++]
++
++[[package]]
++name = "time-core"
++version = "0.1.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7694e1cfe791f8d31026952abf09c69ca6f6fa4e1a1229e18988f06a04a12dca"
++
++[[package]]
++name = "time-macros"
++version = "0.2.27"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2e70e4c5a0e0a8a4823ad65dfe1a6930e4f4d756dcd9dd7939022b5e8c501215"
++dependencies = [
++ "num-conv",
++ "time-core",
++]
++
++[[package]]
++name = "tinyvec"
++version = "1.11.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3e61e67053d25a4e82c844e8424039d9745781b3fc4f32b8d55ed50f5f667ef3"
++dependencies = [
++ "tinyvec_macros",
++]
++
++[[package]]
++name = "tinyvec_macros"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
++
++[[package]]
++name = "tokio"
++version = "1.54.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
++dependencies = [
++ "bytes",
++ "libc",
++ "mio",
++ "parking_lot",
++ "pin-project-lite",
++ "signal-hook-registry",
++ "socket2",
++ "tokio-macros",
++ "tracing",
++ "windows-sys",
++]
++
++[[package]]
++name = "tokio-macros"
++version = "2.7.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "385a6cb71ab9ab790c5fe8d67f1645e6c450a7ce006a33de03daa956cf70a496"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "tokio-stream"
++version = "0.1.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
++dependencies = [
++ "futures-core",
++ "pin-project-lite",
++ "tokio",
++ "tokio-util",
++]
++
++[[package]]
++name = "tokio-util"
++version = "0.7.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
++dependencies = [
++ "bytes",
++ "futures-core",
++ "futures-sink",
++ "futures-util",
++ "pin-project-lite",
++ "tokio",
++]
++
++[[package]]
++name = "toml_datetime"
++version = "1.1.1+spec-1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3165f65f62e28e0115a00b2ebdd37eb6f3b641855f9d636d3cd4103767159ad7"
++dependencies = [
++ "serde_core",
++]
++
++[[package]]
++name = "toml_edit"
++version = "0.25.11+spec-1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0b59c4d22ed448339746c59b905d24568fcbb3ab65a500494f7b8c3e97739f2b"
++dependencies = [
++ "indexmap 2.14.0",
++ "toml_datetime",
++ "toml_parser",
++ "winnow",
++]
++
++[[package]]
++name = "toml_parser"
++version = "1.1.2+spec-1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
++dependencies = [
++ "winnow",
++]
++
++[[package]]
++name = "tower"
++version = "0.4.13"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b8fa9be0de6cf49e536ce1851f987bd21a43b771b09473c3549a6c853db37c1c"
++dependencies = [
++ "futures-core",
++ "futures-util",
++ "pin-project",
++ "pin-project-lite",
++ "tokio",
++ "tokio-util",
++ "tower-layer",
++ "tower-service",
++ "tracing",
++]
++
++[[package]]
++name = "tower-layer"
++version = "0.3.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "121c2a6cda46980bb0fcd1647ffaf6cd3fc79a013de288782836f6df9c48780e"
++
++[[package]]
++name = "tower-service"
++version = "0.3.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
++
++[[package]]
++name = "tracing"
++version = "0.1.44"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
++dependencies = [
++ "log",
++ "pin-project-lite",
++ "tracing-attributes",
++ "tracing-core",
++]
++
++[[package]]
++name = "tracing-attributes"
++version = "0.1.31"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "tracing-core"
++version = "0.1.36"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
++dependencies = [
++ "once_cell",
++ "valuable",
++]
++
++[[package]]
++name = "tracing-error"
++version = "0.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8b1581020d7a273442f5b45074a6a57d5757ad0a47dac0e9f0bd57b81936f3db"
++dependencies = [
++ "tracing",
++ "tracing-subscriber",
++]
++
++[[package]]
++name = "tracing-futures"
++version = "0.2.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "97d095ae15e245a057c8e8451bab9b3ee1e1f68e9ba2b4fbc18d0ac5237835f2"
++dependencies = [
++ "pin-project",
++ "tracing",
++]
++
++[[package]]
++name = "tracing-log"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
++dependencies = [
++ "log",
++ "once_cell",
++ "tracing-core",
++]
++
++[[package]]
++name = "tracing-subscriber"
++version = "0.3.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
++dependencies = [
++ "matchers",
++ "nu-ansi-term",
++ "once_cell",
++ "regex-automata",
++ "sharded-slab",
++ "smallvec",
++ "thread_local",
++ "tracing",
++ "tracing-core",
++ "tracing-log",
++]
++
++[[package]]
++name = "typenum"
++version = "1.20.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
++
++[[package]]
++name = "uint"
++version = "0.9.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "76f64bba2c53b04fcab63c01a7d7427eadc821e3bc48c34dc9ba29c501164b52"
++dependencies = [
++ "byteorder",
++ "crunchy",
++ "hex",
++ "static_assertions",
++]
++
++[[package]]
++name = "uint"
++version = "0.10.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "909988d098b2f738727b161a106cfc7cab00c539c2687a8836f8e565976fb53e"
++dependencies = [
++ "byteorder",
++ "crunchy",
++ "hex",
++ "static_assertions",
++]
++
++[[package]]
++name = "unicode-ident"
++version = "1.0.24"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
++
++[[package]]
++name = "unicode-xid"
++version = "0.2.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
++
++[[package]]
++name = "universal-hash"
++version = "0.6.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f4987bdc12753382e0bec4a65c50738ffaabc998b9cdd1f952fb5f39b0048a96"
++dependencies = [
++ "crypto-common 0.2.2",
++ "ctutils",
++]
++
++[[package]]
++name = "valuable"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
++
++[[package]]
++name = "version_check"
++version = "0.9.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
++
++[[package]]
++name = "visibility"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d674d135b4a8c1d7e813e2f8d1c9a58308aee4a680323066025e53132218bd91"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "wasi"
++version = "0.11.1+wasi-snapshot-preview1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
++
++[[package]]
++name = "wasip2"
++version = "1.0.3+wasi-0.2.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "20064672db26d7cdc89c7798c48a0fdfac8213434a1186e5ef29fd560ae223d6"
++dependencies = [
++ "wit-bindgen 0.57.1",
++]
++
++[[package]]
++name = "wasip3"
++version = "0.4.0+wasi-0.3.0-rc-2026-01-06"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5428f8bf88ea5ddc08faddef2ac4a67e390b88186c703ce6dbd955e1c145aca5"
++dependencies = [
++ "wit-bindgen 0.51.0",
++]
++
++[[package]]
++name = "wasm-bindgen"
++version = "0.2.120"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "df52b6d9b87e0c74c9edfa1eb2d9bf85e5d63515474513aa50fa181b3c4f5db1"
++dependencies = [
++ "cfg-if",
++ "once_cell",
++ "rustversion",
++ "wasm-bindgen-macro",
++ "wasm-bindgen-shared",
++]
++
++[[package]]
++name = "wasm-bindgen-macro"
++version = "0.2.120"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "78b1041f495fb322e64aca85f5756b2172e35cd459376e67f2a6c9dffcedb103"
++dependencies = [
++ "quote",
++ "wasm-bindgen-macro-support",
++]
++
++[[package]]
++name = "wasm-bindgen-macro-support"
++version = "0.2.120"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9dcd0ff20416988a18ac686d4d4d0f6aae9ebf08a389ff5d29012b05af2a1b41"
++dependencies = [
++ "bumpalo",
++ "proc-macro2",
++ "quote",
++ "syn",
++ "wasm-bindgen-shared",
++]
++
++[[package]]
++name = "wasm-bindgen-shared"
++version = "0.2.120"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "49757b3c82ebf16c57d69365a142940b384176c24df52a087fb748e2085359ea"
++dependencies = [
++ "unicode-ident",
++]
++
++[[package]]
++name = "wasm-encoder"
++version = "0.244.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "990065f2fe63003fe337b932cfb5e3b80e0b4d0f5ff650e6985b1048f62c8319"
++dependencies = [
++ "leb128fmt",
++ "wasmparser",
++]
++
++[[package]]
++name = "wasm-metadata"
++version = "0.244.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "bb0e353e6a2fbdc176932bbaab493762eb1255a7900fe0fea1a2f96c296cc909"
++dependencies = [
++ "anyhow",
++ "indexmap 2.14.0",
++ "wasm-encoder",
++ "wasmparser",
++]
++
++[[package]]
++name = "wasmparser"
++version = "0.244.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "47b807c72e1bac69382b3a6fb3dbe8ea4c0ed87ff5629b8685ae6b9a611028fe"
++dependencies = [
++ "bitflags",
++ "hashbrown 0.15.5",
++ "indexmap 2.14.0",
++ "semver",
++]
++
++[[package]]
++name = "windows-core"
++version = "0.62.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
++dependencies = [
++ "windows-implement",
++ "windows-interface",
++ "windows-link",
++ "windows-result",
++ "windows-strings",
++]
++
++[[package]]
++name = "windows-implement"
++version = "0.60.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "windows-interface"
++version = "0.59.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3f316c4a2570ba26bbec722032c4099d8c8bc095efccdc15688708623367e358"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "windows-link"
++version = "0.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
++
++[[package]]
++name = "windows-result"
++version = "0.4.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
++dependencies = [
++ "windows-link",
++]
++
++[[package]]
++name = "windows-strings"
++version = "0.5.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7837d08f69c77cf6b07689544538e017c1bfcf57e34b4c0ff58e6c2cd3b37091"
++dependencies = [
++ "windows-link",
++]
++
++[[package]]
++name = "windows-sys"
++version = "0.61.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
++dependencies = [
++ "windows-link",
++]
++
++[[package]]
++name = "winnow"
++version = "1.0.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2ee1708bef14716a11bae175f579062d4554d95be2c6829f518df847b7b3fdd0"
++dependencies = [
++ "memchr",
++]
++
++[[package]]
++name = "wit-bindgen"
++version = "0.51.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d7249219f66ced02969388cf2bb044a09756a083d0fab1e566056b04d9fbcaa5"
++dependencies = [
++ "wit-bindgen-rust-macro",
++]
++
++[[package]]
++name = "wit-bindgen"
++version = "0.57.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
++
++[[package]]
++name = "wit-bindgen-core"
++version = "0.51.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ea61de684c3ea68cb082b7a88508a8b27fcc8b797d738bfc99a82facf1d752dc"
++dependencies = [
++ "anyhow",
++ "heck",
++ "wit-parser",
++]
++
++[[package]]
++name = "wit-bindgen-rust"
++version = "0.51.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b7c566e0f4b284dd6561c786d9cb0142da491f46a9fbed79ea69cdad5db17f21"
++dependencies = [
++ "anyhow",
++ "heck",
++ "indexmap 2.14.0",
++ "prettyplease",
++ "syn",
++ "wasm-metadata",
++ "wit-bindgen-core",
++ "wit-component",
++]
++
++[[package]]
++name = "wit-bindgen-rust-macro"
++version = "0.51.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0c0f9bfd77e6a48eccf51359e3ae77140a7f50b1e2ebfe62422d8afdaffab17a"
++dependencies = [
++ "anyhow",
++ "prettyplease",
++ "proc-macro2",
++ "quote",
++ "syn",
++ "wit-bindgen-core",
++ "wit-bindgen-rust",
++]
++
++[[package]]
++name = "wit-component"
++version = "0.244.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9d66ea20e9553b30172b5e831994e35fbde2d165325bec84fc43dbf6f4eb9cb2"
++dependencies = [
++ "anyhow",
++ "bitflags",
++ "indexmap 2.14.0",
++ "log",
++ "serde",
++ "serde_derive",
++ "serde_json",
++ "wasm-encoder",
++ "wasm-metadata",
++ "wasmparser",
++ "wit-parser",
++]
++
++[[package]]
++name = "wit-parser"
++version = "0.244.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ecc8ac4bc1dc3381b7f59c34f00b67e18f910c2c0f50015669dde7def656a736"
++dependencies = [
++ "anyhow",
++ "id-arena",
++ "indexmap 2.14.0",
++ "log",
++ "semver",
++ "serde",
++ "serde_derive",
++ "serde_json",
++ "unicode-xid",
++ "wasmparser",
++]
++
++[[package]]
++name = "wyz"
++version = "0.5.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "05f360fc0b24296329c78fda852a1e9ae82de9cf7b27dae4b7f62f118f77b9ed"
++dependencies = [
++ "tap",
++]
++
++[[package]]
++name = "x25519-dalek"
++version = "3.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e7e8131a03190127fb2263afc72b322ecadae46b6ff8c6f399ff5d02f5559af6"
++dependencies = [
++ "curve25519-dalek",
++ "rand_core 0.10.1",
++ "serde",
++ "zeroize",
++]
++
++[[package]]
++name = "zcash_address"
++version = "0.14.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "372023d82d978ab3f27b8e9f7f9b56fc61f3c9cc2b72ec2f8e3bbb278497e474"
++dependencies = [
++ "bech32",
++ "bs58",
++ "corez",
++ "f4jumble",
++ "zcash_encoding",
++ "zcash_protocol",
++]
++
++[[package]]
++name = "zcash_encoding"
++version = "0.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b2871fd3c37eaeb635c815a9c97495553bf8237a481b9f8b37eba661764bf937"
++dependencies = [
++ "corez",
++ "hex",
++ "nonempty",
++]
++
++[[package]]
++name = "zcash_history"
++version = "0.6.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "da3dc4f915efe84d479343fb655505cfd26afcfd965f4678ad5ee339353acd62"
++dependencies = [
++ "blake2b_simd",
++ "corez",
++ "primitive-types",
++ "zcash_encoding",
++]
++
++[[package]]
++name = "zcash_note_encryption"
++version = "0.5.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4812d133908ebf1a1c91d2411a109f63a863a152633db1fc7fbb0f774edeae30"
++dependencies = [
++ "chacha20",
++ "chacha20poly1305",
++ "cipher",
++ "rand_core 0.10.1",
++ "subtle",
++]
++
++[[package]]
++name = "zcash_primitives"
++version = "0.31.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "50ad9ffda3d83c35e401b2f914980762f201ab40525cb0aab67b8d91e180e7df"
++dependencies = [
++ "blake2b_simd",
++ "corez",
++ "document-features",
++ "equihash",
++ "ff",
++ "hex",
++ "incrementalmerkletree",
++ "jubjub",
++ "memuse",
++ "nonempty",
++ "orchard",
++ "rand_core 0.10.1",
++ "redjubjub",
++ "sapling-crypto",
++ "secp256k1",
++ "sha2 0.10.9",
++ "zcash_encoding",
++ "zcash_note_encryption",
++ "zcash_protocol",
++ "zcash_script",
++ "zcash_transparent",
++]
++
++[[package]]
++name = "zcash_protocol"
++version = "0.11.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "266da226b6be42545b9fc299f1def9f5e525764845b8afa874f167155de943ba"
++dependencies = [
++ "corez",
++ "document-features",
++ "hex",
++ "memuse",
++ "zcash_encoding",
++]
++
++[[package]]
++name = "zcash_script"
++version = "0.6.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "10106859d08a2a4119af8a0fa8db72afe35647768b562f94b7a2124adad41275"
++dependencies = [
++ "bip32",
++ "bitflags",
++ "bounded-vec",
++ "hex",
++ "ripemd 0.1.3",
++ "secp256k1",
++ "sha1",
++ "sha2 0.10.9",
++ "thiserror",
++]
++
++[[package]]
++name = "zcash_spec"
++version = "0.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ded3f58b93486aa79b85acba1001f5298f27a46489859934954d262533ee2915"
++dependencies = [
++ "blake2b_simd",
++]
++
++[[package]]
++name = "zcash_transparent"
++version = "0.11.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "eb804d0179500e9543502dd6dfa178826617107897e6fe171241e5b767b7a0dd"
++dependencies = [
++ "bip32",
++ "bs58",
++ "corez",
++ "document-features",
++ "getset",
++ "hex",
++ "nonempty",
++ "ripemd 0.1.3",
++ "secp256k1",
++ "sha2 0.10.9",
++ "subtle",
++ "zcash_encoding",
++ "zcash_protocol",
++ "zcash_script",
++ "zcash_spec",
++ "zip32",
++]
++
++[[package]]
++name = "zebra-chain"
++version = "15.0.0"
++dependencies = [
++ "bech32",
++ "bitflags",
++ "bitflags-serde-legacy",
++ "bitvec",
++ "blake2b_simd",
++ "blake2s_simd",
++ "bounded-vec",
++ "bs58",
++ "byteorder",
++ "chrono",
++ "derive-getters",
++ "dirs",
++ "ed25519-zebra",
++ "equihash",
++ "futures",
++ "group",
++ "halo2_proofs",
++ "hex",
++ "humantime",
++ "incrementalmerkletree",
++ "itertools",
++ "jubjub",
++ "lazy_static",
++ "mset",
++ "num-integer",
++ "orchard",
++ "primitive-types",
++ "rand_core 0.10.1",
++ "rayon",
++ "reddsa",
++ "redjubjub",
++ "ripemd 0.1.3",
++ "sapling-crypto",
++ "schemars 1.2.1",
++ "secp256k1",
++ "serde",
++ "serde-big-array",
++ "serde_with",
++ "sha2 0.10.9",
++ "sinsemilla",
++ "static_assertions",
++ "strum",
++ "tempfile",
++ "thiserror",
++ "tokio",
++ "tracing",
++ "uint 0.10.0",
++ "x25519-dalek",
++ "zcash_address",
++ "zcash_encoding",
++ "zcash_history",
++ "zcash_note_encryption",
++ "zcash_primitives",
++ "zcash_protocol",
++ "zcash_script",
++ "zcash_transparent",
++]
++
++[[package]]
++name = "zebra-network"
++version = "15.0.0"
++dependencies = [
++ "bitflags",
++ "byteorder",
++ "bytes",
++ "chrono",
++ "dirs",
++ "futures",
++ "hex",
++ "humantime-serde",
++ "indexmap 2.14.0",
++ "itertools",
++ "lazy_static",
++ "metrics",
++ "num-integer",
++ "pin-project",
++ "rand 0.10.2",
++ "rayon",
++ "regex",
++ "schemars 1.2.1",
++ "serde",
++ "socket2",
++ "tempfile",
++ "thiserror",
++ "tokio",
++ "tokio-stream",
++ "tokio-util",
++ "tower",
++ "tracing",
++ "tracing-error",
++ "tracing-futures",
++ "zebra-chain",
++]
++
++[[package]]
++name = "zebra-relay"
++version = "0.1.0"
++dependencies = [
++ "futures",
++ "tokio",
++ "tower",
++ "tracing-subscriber",
++ "zebra-chain",
++ "zebra-network",
++]
++
++[[package]]
++name = "zerocopy"
++version = "0.8.48"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "eed437bf9d6692032087e337407a86f04cd8d6a16a37199ed57949d415bd68e9"
++dependencies = [
++ "zerocopy-derive",
++]
++
++[[package]]
++name = "zerocopy-derive"
++version = "0.8.48"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "70e3cd084b1788766f53af483dd21f93881ff30d7320490ec3ef7526d203bad4"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "zeroize"
++version = "1.8.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
++dependencies = [
++ "zeroize_derive",
++]
++
++[[package]]
++name = "zeroize_derive"
++version = "1.4.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "85a5b4158499876c763cb03bc4e49185d3cccbabb15b33c627f7884f43db852e"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "zip32"
++version = "0.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "601ab4bc5f8312fa39f5411e07eb66b538687064c6e936b34eaa78f1e99ebe4d"
++dependencies = [
++ "bech32",
++ "blake2b_simd",
++ "memuse",
++ "subtle",
++ "zcash_spec",
++ "zeroize",
++]
++
++[[package]]
++name = "zmij"
++version = "1.0.21"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+diff --git a/zebra-relay/Cargo.toml b/zebra-relay/Cargo.toml
+index 77e686b..26ad81a 100644
+--- a/zebra-relay/Cargo.toml
++++ b/zebra-relay/Cargo.toml
+@@ -3,12 +3,18 @@ name = "zebra-relay"
+ version = "0.1.0"
+ edition = "2021"
+ publish = false
+-description = "Testbed-only stateless block relay built on zebra-network"
++description = "Testbed-only stateless block relay built on zebra-network. Never run on a real network."
++
++# Its own workspace, so its `testbed` feature never unifies into a zebrad build.
++[workspace]
+ 
+ [dependencies]
+-zebra-network = { path = "../zebra-network" }
++zebra-network = { path = "../zebra-network", features = ["testbed"] }
+ zebra-chain = { path = "../zebra-chain" }
+-tokio = { workspace = true, features = ["full"] }
+-tower = { workspace = true, features = ["util"] }
+-futures = { workspace = true }
+-tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
++tokio = { version = "1.44", features = ["full"] }
++tower = { version = "0.4.13", features = ["util"] }
++futures = "0.3.32"
++tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
++
++[profile.release]
++debug = 1
+diff --git a/zebra-relay/src/main.rs b/zebra-relay/src/main.rs
+index 0be9cae..a5f7fe7 100644
+--- a/zebra-relay/src/main.rs
++++ b/zebra-relay/src/main.rs
+@@ -6,7 +6,7 @@
+ //! Validation is modelled as a fixed delay before a downloaded block is relayed.
+ 
+ use std::{
+-    collections::{HashMap, HashSet},
++    collections::{HashMap, HashSet, VecDeque},
+     net::{IpAddr, SocketAddr},
+     sync::{Arc, Mutex},
+     task::{Context, Poll},
+@@ -27,6 +27,34 @@ use zebra_network::{
+     BoxError, CacheDir, InventoryResponse, PeerSocketAddr, Request, Response,
+ };
+ 
++/// Most block downloads in flight at once, matching zebrad's inbound download limit.
++const MAX_IN_FLIGHT: usize = 200;
++/// Most queued block adverts waiting for the downloader; extras are dropped.
++const ADVERT_QUEUE: usize = 1024;
++/// How many recent blocks the relay keeps to serve to peers.
++const KEEP_BLOCKS: usize = 8;
++
++/// The most recent blocks, oldest evicted first.
++#[derive(Default)]
++struct BlockStore {
++    blocks: HashMap<block::Hash, Arc<Block>>,
++    order: VecDeque<block::Hash>,
++}
++
++impl BlockStore {
++    fn insert(&mut self, hash: block::Hash, block: Arc<Block>) {
++        if self.blocks.insert(hash, block).is_none() {
++            self.order.push_back(hash);
++        }
++        while self.order.len() > KEEP_BLOCKS {
++            if let Some(old) = self.order.pop_front() {
++                self.blocks.remove(&old);
++            }
++        }
++    }
++}
++
++type Store = Arc<Mutex<BlockStore>>;
+ 
+ struct Args {
+     id: usize,
+@@ -81,7 +109,9 @@ fn parse_args() -> Args {
+         lat_min: opt("lat-min", "20").parse().expect("lat-min"),
+         lat_max: opt("lat-max", "150").parse().expect("lat-max"),
+         duration_s: opt("duration-s", "600").parse().expect("duration-s"),
+-        gossip_delay_ms: opt("gossip-delay-ms", "7000").parse().expect("gossip-delay-ms"),
++        gossip_delay_ms: opt("gossip-delay-ms", "7000")
++            .parse()
++            .expect("gossip-delay-ms"),
+         dl_timeout_s: opt("dl-timeout-s", "40").parse().expect("dl-timeout-s"),
+         time_scale: opt("time-scale", "1").parse().expect("time-scale"),
+         estimates: m.get("estimates").cloned(),
+@@ -178,8 +208,8 @@ fn build_block(seed: u64, target_bytes: usize) -> Arc<Block> {
+ 
+ #[derive(Clone)]
+ struct Inbound {
+-    blocks: Arc<Mutex<HashMap<block::Hash, Arc<Block>>>>,
+-    downloads: mpsc::UnboundedSender<(block::Hash, Option<PeerSocketAddr>)>,
++    blocks: Store,
++    downloads: mpsc::Sender<(block::Hash, Option<PeerSocketAddr>)>,
+ }
+ 
+ impl Service<Request> for Inbound {
+@@ -194,7 +224,8 @@ impl Service<Request> for Inbound {
+     fn call(&mut self, req: Request) -> Self::Future {
+         let rsp = match req {
+             Request::AdvertiseBlock(hash, advertiser) => {
+-                let _ = self.downloads.send((hash, advertiser));
++                // A full queue drops the advert, like zebrad's bounded download queue.
++                let _ = self.downloads.try_send((hash, advertiser));
+                 Response::Nil
+             }
+             Request::BlocksByHash(hashes) => {
+@@ -202,7 +233,7 @@ impl Service<Request> for Inbound {
+                 Response::Blocks(
+                     hashes
+                         .into_iter()
+-                        .map(|h| match blocks.get(&h) {
++                        .map(|h| match blocks.blocks.get(&h) {
+                             Some(b) => InventoryResponse::Available((b.clone(), None)),
+                             None => InventoryResponse::Missing(h),
+                         })
+@@ -226,6 +257,19 @@ async fn main() {
+             .with_writer(std::io::stderr)
+             .init();
+     }
++    // This relay forwards blocks without validating them, so it must only ever talk to other
++    // testbed nodes on this machine.
++    let all_local = a.ip.is_loopback()
++        && a.peers.iter().all(|p| {
++            p.parse::<SocketAddr>()
++                .map(|addr| addr.ip().is_loopback())
++                .unwrap_or(false)
++        });
++    if !all_local {
++        eprintln!("zebra-relay only runs on loopback addresses: --ip and every --peers entry must be 127.x.x.x or ::1");
++        std::process::exit(2);
++    }
++
+     let (priority, all) = match a.mode.as_str() {
+         "zebra" => (false, false),
+         "prio" => (true, true),
+@@ -250,7 +294,11 @@ async fn main() {
+         for line in text.lines() {
+             let f: Vec<&str> = line.split_whitespace().collect();
+             if let [ip, mbps] = f.as_slice() {
+-                testbed::seed_peer_rate(ip.parse().expect("ip"), mbps.parse().expect("mbps"));
++                let parsed = ip.parse().ok().zip(mbps.parse::<f64>().ok());
++                let ok = parsed.is_some_and(|(ip, mbps)| testbed::seed_peer_rate(ip, mbps).is_ok());
++                if !ok {
++                    testbed::log_event(&format!("ESTIMATE_REJECTED {line}"));
++                }
+             }
+         }
+     }
+@@ -268,8 +316,8 @@ async fn main() {
+     };
+     config.initial_testnet_peers = a.peers.iter().cloned().collect();
+ 
+-    let blocks: Arc<Mutex<HashMap<block::Hash, Arc<Block>>>> = Default::default();
+-    let (dl_tx, mut dl_rx) = mpsc::unbounded_channel();
++    let blocks: Store = Default::default();
++    let (dl_tx, mut dl_rx) = mpsc::channel(ADVERT_QUEUE);
+     let inbound = Inbound {
+         blocks: blocks.clone(),
+         downloads: dl_tx,
+@@ -291,13 +339,36 @@ async fn main() {
+         let validate = Duration::from_millis(a.validate_ms);
+         let dl_timeout = Duration::from_secs(a.dl_timeout_s);
+         tokio::spawn(async move {
+-            let inflight: Arc<Mutex<HashSet<block::Hash>>> = Default::default();
++            // In-flight hashes and advertiser IPs: one download per hash, one per advertiser IP,
++            // and at most MAX_IN_FLIGHT in total, like zebrad's inbound downloader.
++            let inflight: Arc<Mutex<(HashSet<block::Hash>, HashSet<IpAddr>)>> = Default::default();
+             while let Some((hash, advertiser)) = dl_rx.recv().await {
+-                if blocks.lock().expect("lock").contains_key(&hash)
+-                    || !inflight.lock().expect("lock").insert(hash)
++                if blocks
++                    .lock()
++                    .expect("store lock")
++                    .blocks
++                    .contains_key(&hash)
+                 {
+                     continue;
+                 }
++                let adv_ip = advertiser.map(|a| a.ip());
++                {
++                    let mut f = inflight.lock().expect("in-flight lock");
++                    if f.0.contains(&hash) {
++                        continue;
++                    }
++                    if f.0.len() >= MAX_IN_FLIGHT {
++                        drop(f);
++                        testbed::log_event(&format!("DLSKIP {hash} full"));
++                        continue;
++                    }
++                    if let Some(ip) = adv_ip {
++                        if !f.1.insert(ip) {
++                            continue;
++                        }
++                    }
++                    f.0.insert(hash);
++                }
+                 let adv = advertiser.map(|x| x.to_string()).unwrap_or_default();
+                 testbed::log_event(&format!("INV {hash} {adv}"));
+                 let peer_set = peer_set.clone();
+@@ -316,14 +387,7 @@ async fn main() {
+                                 let from = from.map(|x| x.to_string()).unwrap_or_default();
+                                 testbed::log_event(&format!("RECV {hash} {from}"));
+                                 tokio::time::sleep(validate).await;
+-                                {
+-                                    // Keep memory flat: only recent blocks are ever requested.
+-                                    let mut b = blocks.lock().expect("lock");
+-                                    if b.len() >= 4 {
+-                                        b.clear();
+-                                    }
+-                                    b.insert(hash, block);
+-                                }
++                                blocks.lock().expect("store lock").insert(hash, block);
+                                 testbed::log_event(&format!("VALID {hash}"));
+                                 let _ = tip_tx.send(Some(hash));
+                             } else {
+@@ -336,13 +400,16 @@ async fn main() {
+                                 Ok(Err(e)) => e.to_string(),
+                                 Err(_) => "timeout".to_string(),
+                             };
+-                            testbed::log_event(&format!(
+-                                "DLFAIL {hash} {}",
+-                                why.replace(' ', "_")
+-                            ));
++                            testbed::log_event(&format!("DLFAIL {hash} {}", why.replace(' ', "_")));
++                        }
++                    }
++                    {
++                        let mut f = inflight.lock().expect("in-flight lock");
++                        f.0.remove(&hash);
++                        if let Some(ip) = adv_ip {
++                            f.1.remove(&ip);
+                         }
+                     }
+-                    inflight.lock().expect("lock").remove(&hash);
+                 });
+             }
+         });
+@@ -413,7 +480,7 @@ async fn main() {
+                 let wait = at.saturating_sub(now_ms());
+                 tokio::time::sleep(Duration::from_millis(wait as u64)).await;
+                 let hash = block.hash();
+-                blocks.lock().expect("lock").insert(hash, block);
++                blocks.lock().expect("store lock").insert(hash, block);
+                 testbed::log_event(&format!("MINED {hash}"));
+                 let _ = mined_tx.send(hash);
+             });
+@@ -457,12 +524,20 @@ async fn main() {
+ 
+     tokio::time::sleep(Duration::from_secs(a.duration_s)).await;
+     let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+-    let f: Vec<&str> = stat.rsplit(')').next().unwrap_or("").split_whitespace().collect();
++    let f: Vec<&str> = stat
++        .rsplit(')')
++        .next()
++        .unwrap_or("")
++        .split_whitespace()
++        .collect();
+     let ticks = |i: usize| f.get(i).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0) / 100.0;
+     testbed::log_event(&format!("CPU {:.2} {:.2}", ticks(11), ticks(12)));
+     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+     if let Some(l) = status.lines().find(|l| l.starts_with("VmHWM")) {
+-        testbed::log_event(&format!("MEM {}", l.split_whitespace().nth(1).unwrap_or("0")));
++        testbed::log_event(&format!(
++            "MEM {}",
++            l.split_whitespace().nth(1).unwrap_or("0")
++        ));
+     }
+     testbed::log_event("STOP");
+     std::process::exit(0);
+-- 
+2.43.0
+

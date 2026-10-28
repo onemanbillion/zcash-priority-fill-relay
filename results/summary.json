@@ -1,0 +1,314 @@
+[
+ {
+  "profile": "dc",
+  "attackers": 0,
+  "mode": "prio_warm",
+  "blocks": 6,
+  "runs": 1,
+  "lag_p99_ms": 30,
+  "dl_failures": 0,
+  "p50": 0.909,
+  "p50_ci": [
+   0.872,
+   0.941
+  ],
+  "p90": 1.781,
+  "p90_ci": [
+   1.721,
+   1.848
+  ],
+  "miner_p50": 0.959,
+  "miner_p50_ci": [
+   0.923,
+   0.991
+  ],
+  "miner_p90": 1.831,
+  "miner_p90_ci": [
+   1.772,
+   1.899
+  ],
+  "stale": 0.041,
+  "stale_ci": [
+   0.04,
+   0.042
+  ],
+  "cover": 1.0,
+  "cover_ci": [
+   1.0,
+   1.0
+  ]
+ },
+ {
+  "profile": "dc",
+  "attackers": 0,
+  "mode": "zebra",
+  "blocks": 6,
+  "runs": 1,
+  "lag_p99_ms": 59,
+  "dl_failures": 0,
+  "p50": 1.575,
+  "p50_ci": [
+   1.41,
+   1.761
+  ],
+  "p90": 1.696,
+  "p90_ci": [
+   1.52,
+   1.881
+  ],
+  "miner_p50": 1.626,
+  "miner_p50_ci": [
+   1.46,
+   1.811
+  ],
+  "miner_p90": 1.746,
+  "miner_p90_ci": [
+   1.571,
+   1.931
+  ],
+  "stale": 0.059,
+  "stale_ci": [
+   0.052,
+   0.066
+  ],
+  "cover": 1.0,
+  "cover_ci": [
+   1.0,
+   1.0
+  ]
+ },
+ {
+  "profile": "mixed",
+  "attackers": 0,
+  "mode": "prio",
+  "blocks": 12,
+  "runs": 2,
+  "lag_p99_ms": 37,
+  "dl_failures": 0,
+  "p50": 1.577,
+  "p50_ci": [
+   1.417,
+   1.739
+  ],
+  "p90": 3.531,
+  "p90_ci": [
+   3.294,
+   3.792
+  ],
+  "miner_p50": 1.972,
+  "miner_p50_ci": [
+   1.741,
+   2.185
+  ],
+  "miner_p90": 3.661,
+  "miner_p90_ci": [
+   3.358,
+   3.957
+  ],
+  "stale": 0.077,
+  "stale_ci": [
+   0.069,
+   0.084
+  ],
+  "cover": 1.0,
+  "cover_ci": [
+   1.0,
+   1.0
+  ]
+ },
+ {
+  "profile": "mixed",
+  "attackers": 0,
+  "mode": "prio_third",
+  "blocks": 6,
+  "runs": 1,
+  "lag_p99_ms": 49,
+  "dl_failures": 0,
+  "p50": 1.43,
+  "p50_ci": [
+   1.286,
+   1.62
+  ],
+  "p90": 3.224,
+  "p90_ci": [
+   3.007,
+   3.52
+  ],
+  "miner_p50": 1.779,
+  "miner_p50_ci": [
+   1.49,
+   2.072
+  ],
+  "miner_p90": 3.292,
+  "miner_p90_ci": [
+   2.993,
+   3.696
+  ],
+  "stale": 0.07,
+  "stale_ci": [
+   0.062,
+   0.079
+  ],
+  "cover": 1.0,
+  "cover_ci": [
+   1.0,
+   1.0
+  ]
+ },
+ {
+  "profile": "mixed",
+  "attackers": 0,
+  "mode": "prio_warm",
+  "blocks": 18,
+  "runs": 3,
+  "lag_p99_ms": 106,
+  "dl_failures": 0,
+  "p50": 1.296,
+  "p50_ci": [
+   1.204,
+   1.412
+  ],
+  "p90": 3.376,
+  "p90_ci": [
+   2.911,
+   4.14
+  ],
+  "miner_p50": 0.824,
+  "miner_p50_ci": [
+   0.767,
+   0.888
+  ],
+  "miner_p90": 1.502,
+  "miner_p90_ci": [
+   1.333,
+   1.742
+  ],
+  "stale": 0.036,
+  "stale_ci": [
+   0.032,
+   0.039
+  ],
+  "cover": 1.0,
+  "cover_ci": [
+   1.0,
+   1.0
+  ]
+ },
+ {
+  "profile": "mixed",
+  "attackers": 0,
+  "mode": "zebra",
+  "blocks": 18,
+  "runs": 3,
+  "lag_p99_ms": 103,
+  "dl_failures": 4,
+  "p50": 2.661,
+  "p50_ci": [
+   2.364,
+   2.986
+  ],
+  "p90": 3.345,
+  "p90_ci": [
+   2.86,
+   3.918
+  ],
+  "miner_p50": 2.671,
+  "miner_p50_ci": [
+   2.382,
+   2.989
+  ],
+  "miner_p90": 2.922,
+  "miner_p90_ci": [
+   2.611,
+   3.289
+  ],
+  "stale": 0.1,
+  "stale_ci": [
+   0.089,
+   0.113
+  ],
+  "cover": 0.998,
+  "cover_ci": [
+   0.993,
+   1.0
+  ]
+ },
+ {
+  "profile": "mixed",
+  "attackers": 10,
+  "mode": "prio_warm",
+  "blocks": 6,
+  "runs": 1,
+  "lag_p99_ms": 47,
+  "dl_failures": 7,
+  "p50": 1.406,
+  "p50_ci": [
+   1.329,
+   1.498
+  ],
+  "p90": 3.437,
+  "p90_ci": [
+   3.327,
+   3.585
+  ],
+  "miner_p50": 1.003,
+  "miner_p50_ci": [
+   0.876,
+   1.12
+  ],
+  "miner_p90": 1.838,
+  "miner_p90_ci": [
+   1.714,
+   1.976
+  ],
+  "stale": 0.042,
+  "stale_ci": [
+   0.038,
+   0.045
+  ],
+  "cover": 1.0,
+  "cover_ci": [
+   1.0,
+   1.0
+  ]
+ },
+ {
+  "profile": "mixed",
+  "attackers": 10,
+  "mode": "zebra",
+  "blocks": 6,
+  "runs": 1,
+  "lag_p99_ms": 26,
+  "dl_failures": 5,
+  "p50": 2.211,
+  "p50_ci": [
+   1.91,
+   2.678
+  ],
+  "p90": 2.623,
+  "p90_ci": [
+   2.305,
+   3.12
+  ],
+  "miner_p50": 2.222,
+  "miner_p50_ci": [
+   1.888,
+   2.707
+  ],
+  "miner_p90": 2.421,
+  "miner_p90_ci": [
+   2.115,
+   2.886
+  ],
+  "stale": 0.084,
+  "stale_ci": [
+   0.071,
+   0.102
+  ],
+  "cover": 1.0,
+  "cover_ci": [
+   1.0,
+   1.0
+  ]
+ }
+]

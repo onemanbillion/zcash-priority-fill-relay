@@ -10,13 +10,13 @@ date: "October 28, 2026"
 
 When a Zebra node relays a new block, it answers every peer's request at the same time, so its upload is split evenly and every peer finishes at about the same moment. We propose **priority fill**: serve the peers most likely to relay the block onward first, at their full download speed, and give any spare upload to the next peer in line. Peers are ranked by the throughput a node has measured from them in the past.
 
-In a 100-node testbed built on Zebra's own networking code, with 2 MB blocks every 25 seconds as specified in ZIP 218, priority fill delivered blocks to other miners in a median of 0.82 s instead of 2.67 s. The estimated stale rate fell from 10.0% to 3.6%, below the 5.4% ceiling ZIP 218 uses as a reference. If this held on mainnet, it would raise the hashrate an attacker needs to out-mine the network, reduce the confirmations needed against double-spends, and cut the revenue advantage that faster blocks give large mining pools by about two thirds.
+In a 100-node testbed built on Zebra's own networking code, with 2 MB blocks every 25 seconds, the spacing Zcash has just adopted under ZIP 218, priority fill delivered blocks to other miners in a median of 0.82 s instead of 2.67 s. The estimated stale rate fell from 10.0% to 3.6%, below the 5.4% ceiling ZIP 218 uses as a reference. If this held on mainnet, it would raise the hashrate an attacker needs to out-mine the network, reduce the confirmations needed against double-spends, and cut the revenue advantage that the move to 25-second blocks gives large mining pools by about two thirds.
 
 The gain depends on assumptions not yet verified on a real network. It needs nodes that have learned their peers' throughput; freshly started nodes recovered only about a quarter of it. It does not help the slowest 10% of nodes. It also introduces a ranking that attackers can try to game: ten slow-reading attackers delayed the slowest nodes by 0.8 s. We describe these risks, the mitigations we tested, and the open questions that would need answers before any implementation.
 
 ## 1. Introduction
 
-Shorter block intervals make propagation delay a larger share of each interval, so relay speed becomes a security parameter. [ZIP 218](https://zips.z.cash/zip-0218) cuts Zcash's target spacing from 75 s to 25 s and keeps the 2 MB block limit. Its own figures frame the cost: the mainnet stale rate is about 0.4% today, its theoretical estimate at 25 s is about 3.26%, and a 99-node Zebra devnet with 2 MB blocks measured 4.86%, against a 5.4% reference ceiling.
+Zcash has just moved to 25-second blocks. [ZIP 218](https://zips.z.cash/zip-0218), activated with NU7, cut the target block spacing from 75 s to 25 s and kept the 2 MB block limit. With a third of the time between blocks, the same propagation delay takes up three times as large a share of each interval, so more blocks go stale and more proof of work secures nothing. Relay speed is now a direct lever on how much of Zcash's hashrate actually counts. ZIP 218's own figures frame the cost: the mainnet stale rate was about 0.4% at 75 s spacing, its theoretical estimate at 25 s is about 3.26%, and a 99-node Zebra devnet with 2 MB blocks measured 4.86%, against a 5.4% reference ceiling.
 
 A stale block is honest work thrown away. A higher stale rate lowers the hashrate an attacker needs, weakens each confirmation, and, because a pool never orphans its own blocks, pays large pools more than small ones. ZIP 218 itself links the stale rate to mining centralization.
 
@@ -117,11 +117,11 @@ Times run from the moment a block is mined until a node has received it, in real
 
 ## 7. Security implications
 
-If the testbed's stale-rate reduction carried over to mainnet, most of the security cost that 25-second blocks add would be recovered. The figures below apply standard models to the estimated stale rates; they assume equal-hashrate miners.
+If the testbed's stale-rate reduction carried over to mainnet, most of the security cost of 25-second blocks would be recovered. The figures below apply standard models to the estimated stale rates; they assume equal-hashrate miners.
 
 | Stale rate | Hashrate needed to out-mine the network | Confirmations against a 30% attacker (risk below 0.1%) | Revenue edge of a 46% pool over a 1% pool |
 | --- | --- | --- | --- |
-| 0.4%: mainnet today, 75 s blocks | 49.9% | 24 (30 min) | 0.2% |
+| 0.4%: mainnet before ZIP 218, 75 s blocks | 49.9% | 24 (30 min) | 0.2% |
 | 10.0%: current relay, 25 s blocks, mixed network | 47.4% | 30 (12.5 min) | 4.5% |
 | 3.6%: priority fill, 25 s blocks, mixed network | 49.1% | 26 (10.8 min) | 1.6% |
 | 5.9%: current relay, datacenter-only network | 48.5% | 27 (11.3 min) | 2.7% |
@@ -133,9 +133,9 @@ If the testbed's stale-rate reduction carried over to mainnet, most of the secur
 
 **Selfish mining.** [Gervais et al.](https://eprint.iacr.org/2016/555) found that higher stale rates raise a selfish miner's relative revenue. In [Eyal and Sirer's model](https://arxiv.org/abs/1311.0243) profitability depends on how often honest miners build on a withheld block in a race, which is a propagation contest; getting honest blocks to miners faster narrows that window.
 
-**Mining centralization.** A pool never orphans its own blocks, so its stale rate scales with the hashrate outside it; its edge over a small pool is roughly the difference in their shares times the network stale rate. With the largest pool [near 46% of hashrate](https://bedrock-site.pages.dev/blog/announcing-bedrock), the edge would be 4.5% at a 10% stale rate against 0.2% today, and 1.6% with priority fill. This is likely the most important long-term effect.
+**Mining centralization.** A pool never orphans its own blocks, so its stale rate scales with the hashrate outside it; its edge over a small pool is roughly the difference in their shares times the network stale rate. With the largest pool [near 46% of hashrate](https://bedrock-site.pages.dev/blog/announcing-bedrock), the edge would be 4.5% at a 10% stale rate against 0.2% at 75 s spacing, and 1.6% with priority fill. This is likely the most important long-term effect.
 
-**Caveat.** Real hashrate is concentrated, which lowers measured stale rates (ZIP 218 notes this for mainnet's 0.4%). The direction of every effect above holds, but the absolute numbers should be read as illustrations.
+**Caveat.** Real hashrate is concentrated, which lowers measured stale rates (ZIP 218 notes this for the 0.4% measured at 75 s spacing). The direction of every effect above holds, but the absolute numbers should be read as illustrations.
 
 ## 8. Risks, trade-offs and mitigations
 
@@ -217,11 +217,11 @@ This proposal is a starting point. These are the questions we think would need a
 4. **How robust can the ranking be made?** Which of the proposed mitigations (demotion, prefix caps, random slots, outbound preference) are worth their complexity, and which attacks have we not considered?
 5. **Does this belong in Zebra at all?** It changes behaviour on a security-critical path. Would the Zebra team prefer an opt-in setting, a different layer, or a different approach entirely?
 6. **How does it combine with compact blocks?** Could the same ranking choose high-bandwidth compact-block peers, and how should upload order work for the full-block fallback?
-7. **Does it change the 25-second analysis?** If relay improvements like this one are realistic, should they be part of the evidence for ZIP 218's safety margin, or kept separate?
+7. **What does it mean now that 25-second blocks are live?** The mainnet stale rate under 25-second blocks can now be measured directly, and that measurement is the baseline any relay change should be judged against. If relay improvements like this one are realistic, how should they factor into tracking it, and into any future decisions about block size or spacing?
 
 ## 12. Conclusion
 
-Changing only the order in which a node uploads blocks, with no new messages and no consensus change, cut the estimated stale rate for 2 MB blocks at 25-second spacing from 10.0% to 3.6% in a 100-node testbed built on Zebra's networking code. If anything like that held on mainnet, it would recover most of the security cost of faster blocks, especially the extra advantage they give large pools.
+Changing only the order in which a node uploads blocks, with no new messages and no consensus change, cut the estimated stale rate for 2 MB blocks at 25-second spacing from 10.0% to 3.6% in a 100-node testbed built on Zebra's networking code. If anything like that held on mainnet, it would recover most of the security cost of 25-second blocks, especially the extra advantage they give large pools.
 
 The evidence is early and the costs are real: the gain depends on learned rankings, the slowest nodes do not benefit, and a ranking is something attackers can target. We are not proposing an implementation. We are proposing that upload order deserves a place in the discussion of Zcash block relay, alongside compact blocks, and we invite the Zebra team and the community to challenge the assumptions and help answer the questions in section 11.
 

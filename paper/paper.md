@@ -10,9 +10,9 @@ date: "October 28, 2026"
 
 When a Zebra node relays a new block, it answers every peer's request at the same time, so its upload is split evenly and every peer finishes at about the same moment. We propose **priority fill**: serve the peers most likely to relay the block onward first, at their full download speed, and give any spare upload to the next peer in line. Peers are ranked by the throughput a node has measured from them in the past.
 
-In a 100-node testbed built on Zebra's own networking code, with 2 MB blocks every 25 seconds, the spacing Zcash has just adopted under ZIP 218, priority fill delivered blocks to other miners in a median of 0.82 s instead of 2.67 s. The estimated stale rate fell from 10.0% to 3.6%, below the 5.4% ceiling ZIP 218 uses as a reference. If this held on mainnet, it would raise the hashrate an attacker needs to out-mine the network, reduce the confirmations needed against double-spends, and cut the revenue advantage that the move to 25-second blocks gives large mining pools by about two thirds.
+In a 100-node testbed built on Zebra's own networking code, with 2 MB blocks every 25 seconds, the spacing Zcash has just adopted under ZIP 218, priority fill delivered blocks to other miners in a median of 0.82 s instead of 2.67 s. The estimated stale rate fell from 10.0% to 3.6%, below the 5.4% ceiling ZIP 218 uses as a reference. If this held on mainnet, it would raise the hashrate an attacker needs to out-mine the network, reduce the confirmations needed against double-spends, and cut the revenue advantage that the move to 25-second blocks gives large mining pools by about two thirds. With blocks found at random times, as in real mining, a 1,000-node model of the same relay counted 16.2% of blocks orphaned under today's relay and 6.0% with priority fill; most orphans come from blocks found within seconds of each other, which is exactly where priority fill helps most.
 
-The gain depends on assumptions not yet verified on a real network. It needs nodes that have learned their peers' throughput; freshly started nodes recovered only about a quarter of it. It does not help the slowest 10% of nodes. It also introduces a ranking that attackers can try to game: ten slow-reading attackers delayed the slowest nodes by 0.8 s. We describe these risks, the mitigations we tested, and the open questions that would need answers before any implementation.
+The gain depends on assumptions not yet verified on a real network. It needs nodes that have learned their peers' throughput; freshly started nodes recovered only about a quarter of it. It does not help the slowest 10% of nodes. It also introduces a ranking that attackers can try to game: ten slow-reading attackers delayed the slowest nodes by 0.8 s, and by 0.4 s once a demotion rule was added to the experimental code. We describe these risks, the mitigations we tested, and the open questions that would need answers before any implementation.
 
 ## 1. Introduction
 
@@ -45,6 +45,8 @@ Priority fill changes only the order and overlap of a node's block uploads. Ever
 3. **Fill spare upload.** Another transfer is admitted only when the node's measured upload sits below 85% for 100 ms and at least 50 ms have passed since the last admission. No running transfer is slowed down to make room for a lower-ranked one.
 4. **Bound the wait.** Any request waiting longer than 5 s is served next regardless of rank, and none waits more than 10 s for a slot.
 
+A fifth rule protects the ranking. **Demote stalled readers:** each upload has a deadline, the time a reader at a quarter of the expected speed would take, where the expected speed is the lower of the peer's estimate and this node's own upload. An upload still running at its deadline gives up its slot, so the next transfer starts at once, and the peer's rank is capped at the rate it actually read at. A later normal upload to that peer lifts the cap.
+
 The rule adapts to whichever side is the bottleneck. A home node whose upload is slower than any peer's download ends up sending to one peer at a time; a datacenter node sending to home peers runs several transfers at once without slowing any of them.
 
 ![Figure 1. Worked example: one sender, four requesters, the same total upload in every schedule.](figures/fig1-schedules.png)
@@ -73,6 +75,8 @@ The idea was tested in two stages: discrete-event simulations to explore it, the
 
 **Simulations.** Python models of 1,000 nodes with uneven bandwidth compared fair sharing, strict sequential sending, fixed concurrency limits and priority fill, with rankings from true speeds, noisy measurements, past announcement order and peer counts.
 
+**1,000-node model.** A second model in JavaScript reproduces the testbed's mechanics at ten times the scale: the same node classes and Zebra's 25 outbound connections, nodes in five regions with one-way latency growing with distance (8–160 ms), Zebra's pull relay (announce a validated block to a random third of peers, fetch from the first announcer, retry elsewhere after 20 s), zebrad's 7 s spacing between tip announcements, a 50 ms validation delay, and bandwidth shared in 2 ms steps. Several blocks can be in flight at once and compete for bandwidth; a node validates a block only after its parent, and miners build on the first-seen longest chain, so orphaned blocks are counted directly. Run at 100 nodes it gives estimated stale rates of 9.1% and 2.7%, close to the testbed's 10.0% and 3.6%.
+
 **Testbed node.** A stateless relay binary links Zebra's `zebra-network` and `zebra-chain` crates from `main` (commit 1e03ee75, October 23, 2026). It uses Zebra's real handshake, wire codec, peer set, inventory routing, block download requests and block advertiser, and mirrors zebrad's gossip loop including the 7 s gossip interval. It keeps no chain state, so block validation is replaced by a fixed 50 ms delay. Blocks are 1.95 MB of transparent transactions.
 
 **Emulated network.** Every peer connection is wrapped so each node's total upload and download are capped and each link has a fixed one-way latency of 20–150 ms. Small socket buffers make slow receivers push back on senders as TCP does. Transfer times were checked against configured rates.
@@ -87,6 +91,8 @@ The idea was tested in two stages: discrete-event simulations to explore it, the
 Each node's rates vary about ±35% around its type. Each node opens Zebra's default 25 outbound connections, so hosted nodes have about 65 peers and home nodes about 25. A second network makes every node a datacenter node, closer to ZIP 218's devnet. A third adds ten slow-reading attackers, described in section 8.
 
 **Runs.** 100 nodes per run; a random datacenter node mines a block every 25 s, all miners with equal hashrate. Each run mines 8 blocks and discards the first 2. Three mixed topologies were each run with current Zebra behaviour and with the proposal. All runs used 4× time dilation (bandwidths divided by 4, every delay multiplied by 4) so that 100 nodes fit on one 2-core machine; event-loop lag stayed under 26 ms of real time at the 99th percentile.
+
+**Random block times.** Real blocks arrive as a Poisson process: intervals are exponential with a 25 s mean, so about 11% of blocks come within 3 s of the previous one and about 24% within 7 s. The first testbed runs mined on a fixed 25 s schedule. Later runs, and every model run in section 6.1, mine on a random schedule with the same mean, the same schedule for both modes.
 
 **Learned vs fresh rankings.** A node learns throughput only from blocks it receives, so after 8 blocks it had estimates for about 8% of its peers. To represent a node that has run for hours, "steady state" runs seed each node with its own measured view of every peer, with ±50% error. "Freshly started" runs begin with no estimates.
 
@@ -115,6 +121,28 @@ Times run from the moment a block is mined until a node has received it, in real
 - **Results are consistent across topologies.** Estimated stale rates for current behaviour were 10.1%, 10.0% and 9.8%; for the steady-state proposal 3.1%, 3.4% and 4.1%.
 - **Simulations agreed in direction.** With uneven bandwidth, priority fill was 28% faster than fair sharing for 2 MB blocks, while naive one-at-a-time sending was sometimes slower than fair sharing, because a slow receiver leaves the sender's upload idle.
 
+### 6.1 Random block times
+
+Mining on a fixed schedule hides forks: when every block comes exactly 25 s after the last, almost every miner has the previous block by then. Real mining is a Poisson process, and blocks that follow each other closely carry most of the risk. The 1,000-node model was run for 900 blocks per row (three networks, 300 blocks each) with random block times, counting orphaned blocks directly.
+
+| 1,000-node model | Zebra today | Priority fill |
+| --- | --- | --- |
+| Orphaned blocks, fixed 25 s spacing | 0.2% | 0.0% |
+| Orphaned blocks, random 25 s spacing | 16.2% | 6.0% |
+| Orphaned, of blocks mined within 7 s of the previous | 64% | 26% |
+| Estimated stale rate, random spacing | 18.3% | 6.7% |
+| Median time for a block to reach other miners | 3.44 s | 0.96 s |
+| Orphaned blocks, random spacing, without the 7 s announcement spacing | 13.4% | 3.9% |
+| Orphaned blocks, random 75 s spacing (before ZIP 218) | 5.2% | 1.6% |
+
+- **Random block times turn delay into real forks.** With a fixed schedule the model counts almost no orphans, even though blocks take seconds to arrive. With random times the counted orphan rate (16.2%) is close to the estimate (18.3%), so the estimates used in sections 6 and 7 are a fair guide to what random block times produce.
+- **Close blocks are where priority fill matters most.** Under today's relay, nearly two thirds of blocks mined within 7 s of the previous one were orphaned. Priority fill cut that to about a quarter, because the first block reaches other miners before the second is found.
+- **The 1,000-node network is harder on today's relay than the 100-node testbed.** More hops mean more chances to wait behind a slow uploader, so today's relay degrades from about 10% at 100 nodes to about 16% at 1,000, while priority fill rises only from about 3% to about 6%.
+
+In this model, priority fill at 25 s orphans about as many blocks (6.0%) as today's relay did at 75 s (5.2%). The model's absolute rates run high (mainnet measured 0.4% at 75 s) because every block here is a full 2 MB, hashrate is spread evenly over 40 pools, there are no compact blocks and home connections relay too; the comparison between rows is what it is for.
+
+**An incidental finding: announcement spacing.** zebrad's gossip loop sleeps for PEER_GOSSIP_DELAY (7 s) before each new tip announcement; mined blocks skip the wait, relayed ones do not. The code comment explains that this was sized for blocks every 75 seconds (as of commit 1e03ee75). With random 25 s block times, about a quarter of blocks arrive at a relay while it is still waiting, and their announcement is held back. Removing the spacing in the model cut orphans from 16.2% to 13.4% under today's relay and from 6.0% to 3.9% with priority fill. This is independent of upload order and a much simpler change, and it may already be addressed in newer Zebra code; it is worth checking either way. Together, the two changes took the model from 16.2% to 3.9%.
+
 ## 7. Security implications
 
 If the testbed's stale-rate reduction carried over to mainnet, most of the security cost of 25-second blocks would be recovered. The figures below apply standard models to the estimated stale rates; they assume equal-hashrate miners.
@@ -126,6 +154,8 @@ If the testbed's stale-rate reduction carried over to mainnet, most of the secur
 | 3.6%: priority fill, 25 s blocks, mixed network | 49.1% | 26 (10.8 min) | 1.6% |
 | 5.9%: current relay, datacenter-only network | 48.5% | 27 (11.3 min) | 2.7% |
 | 4.1%: priority fill, datacenter-only network | 49.0% | 26 (10.8 min) | 1.8% |
+| 16.2%: current relay, random 25 s blocks, 1,000-node model (orphans counted) | 45.6% | 36 (15.0 min) | 7.3% |
+| 6.0%: priority fill, random 25 s blocks, 1,000-node model (orphans counted) | 48.5% | 27 (11.3 min) | 2.7% |
 
 **Majority attacks.** Stale blocks are wasted honest work, while an attacker mining privately wastes none. With a stale fraction *s*, an attacker needs (1 − *s*) / (2 − *s*) of total hashrate rather than half.
 
@@ -133,7 +163,7 @@ If the testbed's stale-rate reduction carried over to mainnet, most of the secur
 
 **Selfish mining.** [Gervais et al.](https://eprint.iacr.org/2016/555) found that higher stale rates raise a selfish miner's relative revenue. In [Eyal and Sirer's model](https://arxiv.org/abs/1311.0243) profitability depends on how often honest miners build on a withheld block in a race, which is a propagation contest; getting honest blocks to miners faster narrows that window.
 
-**Mining centralization.** A pool never orphans its own blocks, so its stale rate scales with the hashrate outside it; its edge over a small pool is roughly the difference in their shares times the network stale rate. With the largest pool [near 46% of hashrate](https://bedrock-site.pages.dev/blog/announcing-bedrock), the edge would be 4.5% at a 10% stale rate against 0.2% at 75 s spacing, and 1.6% with priority fill. This is likely the most important long-term effect.
+**Mining centralization.** A pool never orphans its own blocks, so its stale rate scales with the hashrate outside it; its edge over a small pool is roughly the difference in their shares times the network stale rate. With the largest pool [near 46% of hashrate](https://bedrock-site.pages.dev/blog/announcing-bedrock), the edge would be 4.5% at a 10% stale rate against 0.2% at 75 s spacing, and 1.6% with priority fill. In the 1,000-node model with random block times, which counts orphans directly, the edge would be 7.3% under today's relay and 2.7% with priority fill. This is likely the most important long-term effect.
 
 **Caveat.** Real hashrate is concentrated, which lowers measured stale rates (ZIP 218 notes this for the 0.4% measured at 75 s spacing). The direction of every effect above holds, but the absolute numbers should be read as illustrations.
 
@@ -154,6 +184,17 @@ Ten attackers (10% of nodes) had 500 Mb/s upload, so every honest neighbour rank
 
 The attack works only partly, because the scheduler admits the next transfer once upload sits idle for 50 ms. Miners still receive blocks twice as fast, but the network's tail is 0.8 s slower than under current behaviour. This is the clearest cost found.
 
+**With demotion.** The experimental code now demotes stalled readers (section 3). Rerunning the same attack on the same network:
+
+| With 10 attackers | Current relay | Priority fill | Priority fill with demotion |
+| --- | --- | --- | --- |
+| Median node receives block | 2.21 s | 1.41 s | 1.28 s |
+| Slowest 10% of nodes | 2.62 s | 3.44 s | 2.99 s |
+| Other miners receive block (median) | 2.22 s | 1.00 s | 0.94 s |
+| Estimated stale rate | 8.4% | 4.2% | 3.8% |
+
+Demotion halved the tail cost, from 0.8 s to 0.4 s; nodes released about 55 stalled uploads during the run. The slowest nodes are still slower than under today's relay, so the attack is blunted, not removed. This run shared the machine with other work, so event-loop lag was higher than in earlier runs (96 ms at the 99th percentile).
+
 ### 8.2 Trade-offs
 
 - **Fairness.** Low-ranked peers, mostly home nodes, wait in upload queues (median 0.6 s, longest about 4 s per block). The slowest 10% gain nothing and can lose.
@@ -165,7 +206,7 @@ The attack works only partly, because the scheduler admits the next transfer onc
 
 | Risk | What could happen | Mitigation | Status |
 | --- | --- | --- | --- |
-| Slow-reading peers | A peer earns a high rank, then stalls to delay others | Admit the next transfer when upload goes idle; demote peers whose transfers run far below their estimate | Idle admission tested; demotion not built |
+| Slow-reading peers | A peer earns a high rank, then stalls to delay others | Admit the next transfer when upload goes idle; demote peers whose transfers run far below their estimate | Built and tested: tail cost halved, not removed |
 | Starvation | A high-ranked peer that keeps requesting holds the uplink indefinitely | Serve any request waiting over 5 s first; cap waits at 10 s; serve repeat requests for the same block last | Built and tested |
 | Rank inflation | A peer sends unsolicited bulk data to look fast | Count only replies to this node's own block requests | Built and tested |
 | Ranking capture | Fast attacker nodes rank first everywhere, learn new blocks earliest and become relay chokepoints | Expire estimates; cap top-ranked slots per network prefix; prefer outbound peers; keep a random-choice slot, as BitTorrent's optimistic unchoke does | Expiry built; others proposed |
@@ -203,7 +244,7 @@ These results show direction and rough size, not mainnet numbers.
 - **No real validation.** A fixed 50 ms stands in for verification; ZIP 218 reports worst-case shielded verification of 272–432 ms, which would add the same delay per hop in both modes.
 - **Emulated steady state.** Learned rankings were emulated by seeding noisy estimates, not by running nodes for hours.
 - **Scale.** 100 nodes on one machine with 4× time dilation; 6 measured blocks per run. Confidence intervals are shown, but more runs would narrow them.
-- **Estimated, not observed, stale rates.** Blocks were mined on a schedule, so forks were modelled from delays rather than counted.
+- **Estimated, not observed, stale rates.** The first testbed runs mined on a fixed schedule, so forks there were modelled from delays. The 1,000-node model and the later testbed runs mine at random times; the model counts orphans directly, but it is a simplified bandwidth model rather than Zebra's code.
 - **One attack.** Only the slow-reading attack was tested.
 - **Full blocks only.** Every block was 1.95 MB; compact blocks were not modelled.
 
@@ -214,20 +255,20 @@ This proposal is a starting point. These are the questions we think would need a
 1. **Is the gain real on mainnet?** What do Zcash nodes' bandwidths and connectivity actually look like, and how much of block relay is full blocks once compact blocks ship? Would a measurement study of the live network, or a testnet trial with real 2 MB blocks, be the right first step?
 2. **Is the fairness trade acceptable?** Priority fill helps miners and well-connected nodes and does nothing for the slowest. Is that the right priority for Zcash, and should home nodes be protected, for example with a guaranteed share of upload?
 3. **What should the ranking measure?** Throughput from past block replies learns slowly. Should nodes also measure transaction relay, persist estimates across restarts, or share nothing and stay purely local?
-4. **How robust can the ranking be made?** Which of the proposed mitigations (demotion, prefix caps, random slots, outbound preference) are worth their complexity, and which attacks have we not considered?
+4. **How robust can the ranking be made?** Demotion is now built and halves the cost of the one attack tested. Which of the remaining mitigations (prefix caps, random slots, outbound preference) are worth their complexity, and which attacks have we not considered?
 5. **Does this belong in Zebra at all?** It changes behaviour on a security-critical path. Would the Zebra team prefer an opt-in setting, a different layer, or a different approach entirely?
 6. **How does it combine with compact blocks?** Could the same ranking choose high-bandwidth compact-block peers, and how should upload order work for the full-block fallback?
-7. **What does it mean now that 25-second blocks are live?** The mainnet stale rate under 25-second blocks can now be measured directly, and that measurement is the baseline any relay change should be judged against. If relay improvements like this one are realistic, how should they factor into tracking it, and into any future decisions about block size or spacing?
+7. **What does it mean now that 25-second blocks are live?** The mainnet stale rate under 25-second blocks can now be measured directly, and that measurement is the baseline any relay change should be judged against. If relay improvements like this one are realistic, how should they factor into tracking it, and into any future decisions about block size or spacing? Separately, should zebrad's 7 s announcement spacing (section 6.1) be revisited for 25-second blocks?
 
 ## 12. Conclusion
 
-Changing only the order in which a node uploads blocks, with no new messages and no consensus change, cut the estimated stale rate for 2 MB blocks at 25-second spacing from 10.0% to 3.6% in a 100-node testbed built on Zebra's networking code. If anything like that held on mainnet, it would recover most of the security cost of 25-second blocks, especially the extra advantage they give large pools.
+Changing only the order in which a node uploads blocks, with no new messages and no consensus change, cut the estimated stale rate for 2 MB blocks at 25-second spacing from 10.0% to 3.6% in a 100-node testbed built on Zebra's networking code. If anything like that held on mainnet, it would recover most of the security cost of 25-second blocks, especially the extra advantage they give large pools. With blocks found at random times, a 1,000-node model counted 16.2% of blocks orphaned under today's relay against 6.0% with priority fill.
 
-The evidence is early and the costs are real: the gain depends on learned rankings, the slowest nodes do not benefit, and a ranking is something attackers can target. We are not proposing an implementation. We are proposing that upload order deserves a place in the discussion of Zcash block relay, alongside compact blocks, and we invite the Zebra team and the community to challenge the assumptions and help answer the questions in section 11.
+The evidence is early and the costs are real: the gain depends on learned rankings, the slowest nodes do not benefit, and a ranking is something attackers can target; demotion limits, but does not remove, the one attack we tested. We are not proposing an implementation. We are proposing that upload order deserves a place in the discussion of Zcash block relay, alongside compact blocks, and we invite the Zebra team and the community to challenge the assumptions and help answer the questions in section 11.
 
 ## References and reproducibility
 
-**Code and data.** The experimental code, simulation and analysis scripts, run data and node logs are in [github.com/onemanbillion/zcash-priority-fill-relay](https://github.com/onemanbillion/zcash-priority-fill-relay). The Zebra changes apply to `main` at commit 1e03ee75 and sit behind an off-by-default `testbed` feature; the relay binary refuses to run on non-loopback addresses. None of it is intended for use on a real network.
+**Code and data.** The experimental code, simulation and analysis scripts, run data and node logs are in [github.com/onemanbillion/zcash-priority-fill-relay](https://github.com/onemanbillion/zcash-priority-fill-relay). The Zebra changes apply to `main` at commit 1e03ee75 and sit behind an off-by-default `testbed` feature; the relay binary refuses to run on non-loopback addresses. None of it is intended for use on a real network. The 1,000-node model and its analysis script are in the repository's model folder.
 
 **Tools.** The analysis, experiments, code and drafting of this paper were carried out with the assistance of an AI model (Claude, by Anthropic). All results come from the runs described in section 5.
 

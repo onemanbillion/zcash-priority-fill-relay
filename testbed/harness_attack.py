@@ -8,7 +8,7 @@ they read in real seconds. It keeps the machine's CPU from becoming the bottlene
 """
 import argparse, json, math, os, random, signal, subprocess, sys, time
 
-BIN = os.environ.get("ZEBRA_RELAY_BIN", "zebra-relay")  # path to the built zebra-relay binary
+BIN = "/home/claude/zebra/zebra-relay/target/release/zebra-relay"
 CLASSES = [("datacenter", .30, 500, 500), ("fiber", .25, 100, 500),
            ("cable", .35, 15, 150), ("poor", .10, 3, 25)]
 REACH = {"datacenter": 1.0, "fiber": .5, "cable": .2, "poor": .05}
@@ -61,6 +61,8 @@ def main():
     ap.add_argument("--ip-base", type=int, default=0)
     ap.add_argument("--profile", default="mixed")
     ap.add_argument("--attackers", type=int, default=0)
+    ap.add_argument("--poisson", type=int, default=0,
+                    help="if non-zero, draw block intervals from an exponential distribution with this seed")
     a = ap.parse_args()
     global IP_BASE
     IP_BASE = a.ip_base
@@ -78,14 +80,17 @@ def main():
     miners = [x["id"] for x in nodes if x["cls"] == "datacenter"]
     t0 = int(time.time() * 1000) + int((a.n * a.stagger + a.warmup * D) * 1000)
     sched = []
+    prng = random.Random(a.poisson)
+    t_rel = 0.0
     for b in range(a.blocks):
-        sched.append((t0 + int(b * a.interval * D * 1000), rng.choice(miners), rng.getrandbits(48)))
+        sched.append((t0 + int(t_rel * D * 1000), rng.choice(miners), rng.getrandbits(48)))
+        t_rel += prng.expovariate(1.0 / a.interval) if a.poisson else a.interval
     with open(f"{a.out}/schedule.txt", "w") as f:
         for t, m, s in sched:
             f.write(f"{t} {m} {s}\n")
     meta = dict(vars(a), nodes=nodes, outbound=out, schedule=sched)
     json.dump(meta, open(f"{a.out}/meta.json", "w"))
-    duration = a.n * a.stagger + a.warmup * D + a.blocks * a.interval * D + 15 * D
+    duration = a.n * a.stagger + a.warmup * D + (sched[-1][0] - t0) / 1000 + a.interval * D + 15 * D
     procs = []
     byid = {x["id"]: x for x in nodes}
     peers_of = {x["id"]: set(out[x["id"]]) for x in nodes}

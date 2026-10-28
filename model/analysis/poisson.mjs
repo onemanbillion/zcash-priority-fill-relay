@@ -1,6 +1,7 @@
 // Long Poisson-mining runs of the browser model, for the paper.
 // Usage: node analysis/poisson.mjs > analysis/results.json
 import { makeNetwork, Sim, poissonSchedule, PARAMS } from '../sim.js';
+import { appendFileSync } from 'node:fs';
 
 const BLOCKS = +(process.env.BLOCKS || 300), SEEDS = (process.env.SEEDS || '1,2,3').split(',').map(Number);
 const configs = [
@@ -51,6 +52,7 @@ for (const c of configs) {
       attackThreshold: (1 - o) / (2 - o), poolEdge46: 0.45 * o, demotionsPerBlock: agg.demotions / agg.blocks,
       shortGapBlocks: agg.short.n, shortGapForkShare: agg.short.n ? agg.short.orph / agg.short.n : null };
     out[`${c.name}/${modeName}`] = r;
+    appendFileSync(new URL('./results.jsonl', import.meta.url), JSON.stringify({ key: `${c.name}/${modeName}`, ...r }) + '\n');
     console.error(c.name, modeName, Object.entries(r).map(([k, v]) => `${k}=${typeof v === 'number' ? (v < 1 && v > 0 ? v.toFixed(4) : v.toFixed(2)) : v}`).join(' '));
   }
 }

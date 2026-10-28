@@ -1,7 +1,7 @@
 From 8adf60516ec18a02f35dbec30220ff3a35771ef4 Mon Sep 17 00:00:00 2001
 From: testbed <hello@paul.church>
 Date: Wed, 28 Oct 2026 13:29:05 -0500
-Subject: [PATCH 3/3] fix(network): set testbed fairness bounds above normal
+Subject: [PATCH 3/4] fix(network): set testbed fairness bounds above normal
  queue times
 
 A 500 ms fairness bound and 2 s gate cap reordered or force-admitted normal

@@ -169,7 +169,6 @@ export class Sim {
     this.S = net.nodes.map(() => ({ active: [], waiting: [], lastAdmit: -1, belowSince: -1 }));
     this.downActive = new Uint16Array(N);
     this.busy = new Set();
-    this.reqs = [];
     this.caps = new Map(); // sender*N+peer -> demoted rate cap (Mb/s)
     this.recent = []; // completed or aborted transfers, for drawing
     this.demotions = 0;
@@ -252,8 +251,7 @@ export class Sim {
       const s = this.S[b];
       if (this.mode === 'fair') this.start(req, te); else s.waiting.push(req);
       this.busy.add(b);
-      this.reqs.push(req);
-      this.heap.push([te + p.requestTimeoutS, TIMEOUT, a, b, this.reqs.length - 1]);
+      this.heap.push([te + p.requestTimeoutS, TIMEOUT, a, b, req]);
     } else if (kind === ARRIVE) {
       this.arrived(a, b, x, te);
     } else if (kind === VALID) {
@@ -268,7 +266,7 @@ export class Sim {
         this.lastGossip[a] = te; this.lastAnnounced[a] = tip;
       }
     } else if (kind === TIMEOUT) {
-      const req = this.reqs[x];
+      const req = x;
       const blk = this.blocks[req.blk];
       if (req.done || blk.recv[a] !== Infinity) return;
       // The requester gives up. A response not started yet is dropped; one already being sent

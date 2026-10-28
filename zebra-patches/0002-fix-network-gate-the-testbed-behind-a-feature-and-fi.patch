@@ -1,7 +1,7 @@
 From 031aa398883c06c9761261f5bcfe4df0411d873b Mon Sep 17 00:00:00 2001
 From: testbed <hello@paul.church>
 Date: Wed, 28 Oct 2026 12:40:28 -0500
-Subject: [PATCH 2/3] fix(network): gate the testbed behind a feature and fix
+Subject: [PATCH 2/4] fix(network): gate the testbed behind a feature and fix
  its security and correctness issues
 
 - Put link emulation, the upload scheduler and the testbed constants behind an

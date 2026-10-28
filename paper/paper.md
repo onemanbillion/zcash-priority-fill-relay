@@ -92,7 +92,7 @@ Each node's rates vary about ±35% around its type. Each node opens Zebra's defa
 
 **Runs.** 100 nodes per run; a random datacenter node mines a block every 25 s, all miners with equal hashrate. Each run mines 8 blocks and discards the first 2. Three mixed topologies were each run with current Zebra behaviour and with the proposal. All runs used 4× time dilation (bandwidths divided by 4, every delay multiplied by 4) so that 100 nodes fit on one 2-core machine; event-loop lag stayed under 26 ms of real time at the 99th percentile.
 
-**Random block times.** Real blocks arrive as a Poisson process: intervals are exponential with a 25 s mean, so about 11% of blocks come within 3 s of the previous one and about 24% within 7 s. The first testbed runs mined on a fixed 25 s schedule. Later runs, and every model run in section 6.1, mine on a random schedule with the same mean, the same schedule for both modes.
+**Random block times.** Real blocks arrive as a Poisson process: intervals are exponential with a 25 s mean, so about 11% of blocks come within 3 s of the previous one and about 24% within 7 s. The testbed runs mined on a fixed 25 s schedule. Every model run in section 6.1 mines on a random schedule with the same mean, the same schedule for both modes. Testbed runs with random block times were attempted but could not be used: when blocks arrived seconds apart, 100 nodes on one 8 GB machine ran out of memory and stalled for tens of seconds.
 
 **Learned vs fresh rankings.** A node learns throughput only from blocks it receives, so after 8 blocks it had estimates for about 8% of its peers. To represent a node that has run for hours, "steady state" runs seed each node with its own measured view of every peer, with ±50% error. "Freshly started" runs begin with no estimates.
 
@@ -193,7 +193,7 @@ The attack works only partly, because the scheduler admits the next transfer onc
 | Other miners receive block (median) | 2.22 s | 1.00 s | 0.94 s |
 | Estimated stale rate | 8.4% | 4.2% | 3.8% |
 
-Demotion halved the tail cost, from 0.8 s to 0.4 s; nodes released about 55 stalled uploads during the run. The slowest nodes are still slower than under today's relay, so the attack is blunted, not removed. This run shared the machine with other work, so event-loop lag was higher than in earlier runs (96 ms at the 99th percentile).
+Demotion halved the tail cost, from 0.8 s to 0.4 s; nodes released about 55 stalled uploads during the run. The slowest nodes are still slower than under today's relay, so the attack is blunted, not removed. This run shared the machine with other work, so event-loop lag was higher than in earlier runs (96 ms at the 99th percentile). Without attackers, demotion fired only three times in a run and the estimated stale rate was 3.6%, against 3.1% in two runs without it; with six measured blocks per run that gap is within run-to-run variation, but a small cost cannot be ruled out.
 
 ### 8.2 Trade-offs
 
@@ -244,7 +244,7 @@ These results show direction and rough size, not mainnet numbers.
 - **No real validation.** A fixed 50 ms stands in for verification; ZIP 218 reports worst-case shielded verification of 272–432 ms, which would add the same delay per hop in both modes.
 - **Emulated steady state.** Learned rankings were emulated by seeding noisy estimates, not by running nodes for hours.
 - **Scale.** 100 nodes on one machine with 4× time dilation; 6 measured blocks per run. Confidence intervals are shown, but more runs would narrow them.
-- **Estimated, not observed, stale rates.** The first testbed runs mined on a fixed schedule, so forks there were modelled from delays. The 1,000-node model and the later testbed runs mine at random times; the model counts orphans directly, but it is a simplified bandwidth model rather than Zebra's code.
+- **Estimated, not observed, stale rates.** The first testbed runs mined on a fixed schedule, so forks there were modelled from delays. The 1,000-node model mines at random times and counts orphans directly, but it is a simplified bandwidth model rather than Zebra's code. Testbed runs with random block times exceeded this machine's memory when blocks overlapped, so random block times have not yet been tested on Zebra's own code.
 - **One attack.** Only the slow-reading attack was tested.
 - **Full blocks only.** Every block was 1.95 MB; compact blocks were not modelled.
 

@@ -13,18 +13,20 @@ def run_stats(run, skip=2, T=25.0, short=7.0):
     forks = pairs = 0
     short_rows, all_rows = [], []
     s = analyze.stats(run, skip=skip, T=T)
-    rows = s["rows"]
+    miners_all = [x["id"] for x in meta["nodes"] if x["cls"] == "datacenter"]
     for k in range(skip, len(order)):
         h = order[k]
         t0, miner = mined[h]
+        tv = [((valid[h][j] - t0) / D) if j in valid[h] else float("inf") for j in miners_all if j != miner]
+        stale = st.mean(1 - math.exp(-x / T) if x != float("inf") else 1.0 for x in tv)
         gap = (t0 - mined[order[k - 1]][0]) / D if k else None
-        all_rows.append(rows[k - skip]["stale"])
+        all_rows.append(stale)
         if gap is not None and gap < short:
-            short_rows.append(rows[k - skip]["stale"])
+            short_rows.append(stale)
         if k + 1 < len(order):
             t1, m1 = mined[order[k + 1]]
             pairs += 1
-            if valid[h].get(m1, float("inf")) > t1 and m1 != miner:
+            if m1 != miner and valid[h].get(m1, float("inf")) > t1:
                 forks += 1
     lv = s.get("lag_p99_ms")
     return dict(run=run, mode=meta["mode"], blocks=len(all_rows), est_stale=st.mean(all_rows),

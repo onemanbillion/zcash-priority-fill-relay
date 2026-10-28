@@ -15,8 +15,8 @@ In a 100-node testbed built on Zebra's own networking code, with 2 MB blocks eve
 | --- | --- |
 | `paper/` | The paper (PDF and Markdown) and the script that draws its figures |
 | `zebra-patches/` | Four commits against Zebra `main` at 1e03ee75 (`git am`): link emulation, the priority-fill scheduler with demotion of stalled readers, 16 regression tests, and the `zebra-relay` stateless relay binary |
-| `testbed/` | `harness_attack.py` launches one 100-node experiment; `run_matrix.sh` reproduces every run in the paper; `analyze.py` / `summarize.py` compute the statistics; `--poisson SEED` mines at random times and `poisson_analyze.py` counts forks |
-| `model/` | The 1,000-node JavaScript model with random (Poisson) block times, overlapping blocks, orphan counting and demotion; `node model/analysis/poisson.mjs` reproduces section 6.1 |
+| `testbed/` | `harness_attack.py` launches one 100-node experiment; `run_matrix.sh` reproduces every run in the paper; `analyze.py` / `summarize.py` compute the statistics; `--poisson SEED` mines with Poisson block arrivals and `poisson_analyze.py` counts forks |
+| `model/` | The 1,000-node JavaScript model with Poisson block arrivals, overlapping blocks, orphan counting and demotion; `node model/analysis/poisson.mjs` reproduces section 6.1 |
 | `simulations/` | The earlier discrete-event models (fair sharing vs sequential vs priority fill, ranking signals, Smith's rule) |
 | `results/` | Summary statistics, per-run metadata and every node's log |
 

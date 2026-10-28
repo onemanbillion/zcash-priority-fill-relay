@@ -10,7 +10,7 @@ date: "October 28, 2026"
 
 When a Zebra node relays a new block, it answers every peer's request at the same time, so its upload is split evenly and every peer finishes at about the same moment. We propose **priority fill**: serve the peers most likely to relay the block onward first, at their full download speed, and give any spare upload to the next peer in line. Peers are ranked by the throughput a node has measured from them in the past.
 
-In a 100-node testbed built on Zebra's own networking code, with 2 MB blocks every 25 seconds, the spacing Zcash adopts under ZIP 218 with the NU7 upgrade on 5 November 2026, priority fill delivered blocks to other miners in a median of 0.82 s instead of 2.67 s. The estimated stale rate fell from 10.0% to 3.6%, below the 5.4% ceiling ZIP 218 uses as a reference. If this held on mainnet, it would raise the hashrate an attacker needs to out-mine the network, reduce the confirmations needed against double-spends, and cut the revenue advantage that the move to 25-second blocks gives large mining pools by about two thirds. With blocks found at random times, as in real mining, a 1,000-node model of the same relay counted 16.2% of blocks orphaned under today's relay and 6.0% with priority fill; most orphans come from blocks found within seconds of each other, which is exactly where priority fill helps most.
+In a 100-node testbed built on Zebra's own networking code, with 2 MB blocks every 25 seconds, the spacing Zcash adopts under ZIP 218 with the NU7 upgrade on 5 November 2026, priority fill delivered blocks to other miners in a median of 0.82 s instead of 2.67 s. The estimated stale rate fell from 10.0% to 3.6%, below the 5.4% ceiling ZIP 218 uses as a reference. If this held on mainnet, it would raise the hashrate an attacker needs to out-mine the network, reduce the confirmations needed against double-spends, and cut the revenue advantage that the move to 25-second blocks gives large mining pools by about two thirds. With block arrivals following a Poisson process, as in real mining, a 1,000-node model of the same relay counted 16.2% of blocks orphaned under today's relay and 6.0% with priority fill; most orphans come from blocks found within seconds of each other, which is exactly where priority fill helps most.
 
 The gain depends on assumptions not yet verified on a real network. It needs nodes that have learned their peers' throughput; freshly started nodes recovered only about a quarter of it. It does not help the slowest 10% of nodes. It also introduces a ranking that attackers can try to game: ten slow-reading attackers delayed the slowest nodes by 0.8 s, and by 0.4 s once a demotion rule was added to the experimental code. We describe these risks, the mitigations we tested, and the open questions that would need answers before any implementation.
 
@@ -92,7 +92,7 @@ Each node's rates vary about ±35% around its type. Each node opens Zebra's defa
 
 **Runs.** 100 nodes per run; a random datacenter node mines a block every 25 s, all miners with equal hashrate. Each run mines 8 blocks and discards the first 2. Three mixed topologies were each run with current Zebra behaviour and with the proposal. All runs used 4× time dilation (bandwidths divided by 4, every delay multiplied by 4) so that 100 nodes fit on one 2-core machine; event-loop lag stayed under 26 ms of real time at the 99th percentile.
 
-**Random block times.** Real blocks arrive as a Poisson process: intervals are exponential with a 25 s mean, so about 11% of blocks come within 3 s of the previous one and about 24% within 7 s. The testbed runs mined on a fixed 25 s schedule. Every model run in section 6.1 mines on a random schedule with the same mean, the same schedule for both modes. Testbed runs with random block times were attempted but could not be used: when blocks arrived seconds apart, 100 nodes on one 8 GB machine ran out of memory and stalled for tens of seconds.
+**Poisson block arrivals.** Real blocks arrive as a Poisson process: intervals are exponential with a 25 s mean, so about 11% of blocks come within 3 s of the previous one and about 24% within 7 s. The testbed runs mined on a fixed 25 s schedule. Every model run in section 6.1 mines on a Poisson schedule with the same mean, the same schedule for both modes. Testbed runs with Poisson block arrivals were attempted but could not be used: when blocks arrived seconds apart, 100 nodes on one 8 GB machine ran out of memory and stalled for tens of seconds.
 
 **Learned vs fresh rankings.** A node learns throughput only from blocks it receives, so after 8 blocks it had estimates for about 8% of its peers. To represent a node that has run for hours, "steady state" runs seed each node with its own measured view of every peer, with ±50% error. "Freshly started" runs begin with no estimates.
 
@@ -121,27 +121,27 @@ Times run from the moment a block is mined until a node has received it, in real
 - **Results are consistent across topologies.** Estimated stale rates for current behaviour were 10.1%, 10.0% and 9.8%; for the steady-state proposal 3.1%, 3.4% and 4.1%.
 - **Simulations agreed in direction.** With uneven bandwidth, priority fill was 28% faster than fair sharing for 2 MB blocks, while naive one-at-a-time sending was sometimes slower than fair sharing, because a slow receiver leaves the sender's upload idle.
 
-### 6.1 Random block times
+### 6.1 Poisson block arrivals
 
-Mining on a fixed schedule hides forks: when every block comes exactly 25 s after the last, almost every miner has the previous block by then. Real mining is a Poisson process, and blocks that follow each other closely carry most of the risk. The 1,000-node model was run for 900 blocks per row (three networks, 300 blocks each) with random block times, counting orphaned blocks directly.
+Mining on a fixed schedule hides forks: when every block comes exactly 25 s after the last, almost every miner has the previous block by then. Real mining is a Poisson process, and blocks that follow each other closely carry most of the risk. The 1,000-node model was run for 900 blocks per row (three networks, 300 blocks each) with Poisson block arrivals, counting orphaned blocks directly.
 
 | 1,000-node model | Zebra today | Priority fill |
 | --- | --- | --- |
 | Orphaned blocks, fixed 25 s spacing | 0.2% | 0.0% |
-| Orphaned blocks, random 25 s spacing | 16.2% | 6.0% |
+| Orphaned blocks, Poisson arrivals, 25 s mean | 16.2% | 6.0% |
 | Orphaned, of blocks mined within 7 s of the previous | 64% | 26% |
-| Estimated stale rate, random spacing | 18.3% | 6.7% |
+| Estimated stale rate, Poisson arrivals | 18.3% | 6.7% |
 | Median time for a block to reach other miners | 3.44 s | 0.96 s |
-| Orphaned blocks, random spacing, without the 7 s announcement spacing | 13.4% | 3.9% |
-| Orphaned blocks, random 75 s spacing (today, before NU7) | 5.2% | 1.6% |
+| Orphaned blocks, Poisson arrivals, without the 7 s announcement spacing | 13.4% | 3.9% |
+| Orphaned blocks, Poisson arrivals, 75 s mean (today, before NU7) | 5.2% | 1.6% |
 
-- **Random block times turn delay into real forks.** With a fixed schedule the model counts almost no orphans, even though blocks take seconds to arrive. With random times the counted orphan rate (16.2%) is close to the estimate (18.3%), so the estimates used in sections 6 and 7 are a fair guide to what random block times produce.
+- **Poisson arrivals turn delay into real forks.** With a fixed schedule the model counts almost no orphans, even though blocks take seconds to arrive. With Poisson arrivals the counted orphan rate (16.2%) is close to the estimate (18.3%), so the estimates used in sections 6 and 7 are a fair guide to what Poisson block arrivals produce.
 - **Close blocks are where priority fill matters most.** Under today's relay, nearly two thirds of blocks mined within 7 s of the previous one were orphaned. Priority fill cut that to about a quarter, because the first block reaches other miners before the second is found.
 - **The 1,000-node network is harder on today's relay than the 100-node testbed.** More hops mean more chances to wait behind a slow uploader, so today's relay degrades from about 10% at 100 nodes to about 16% at 1,000, while priority fill rises only from about 3% to about 6%.
 
 In this model, priority fill at 25 s orphans about as many blocks (6.0%) as today's relay does at today's 75 s spacing (5.2%). The model's absolute rates run high (mainnet measured 0.4% at 75 s) because every block here is a full 2 MB, hashrate is spread evenly over 40 pools, there are no compact blocks and home connections relay too; the comparison between rows is what it is for.
 
-**An incidental finding: announcement spacing.** zebrad's gossip loop sleeps for PEER_GOSSIP_DELAY (7 s) before each new tip announcement; mined blocks skip the wait, relayed ones do not. The code comment explains that this was sized for blocks every 75 seconds (as of commit 1e03ee75). With random 25 s block times, about a quarter of blocks arrive at a relay while it is still waiting, and their announcement is held back. Removing the spacing in the model cut orphans from 16.2% to 13.4% under today's relay and from 6.0% to 3.9% with priority fill. This is independent of upload order and a much simpler change, and it may already be addressed in newer Zebra code; it is worth checking either way. Together, the two changes took the model from 16.2% to 3.9%.
+**An incidental finding: announcement spacing.** zebrad's gossip loop sleeps for PEER_GOSSIP_DELAY (7 s) before each new tip announcement; mined blocks skip the wait, relayed ones do not. The code comment explains that this was sized for blocks every 75 seconds (as of commit 1e03ee75). With Poisson block arrivals at a 25 s mean, about a quarter of blocks arrive at a relay while it is still waiting, and their announcement is held back. Removing the spacing in the model cut orphans from 16.2% to 13.4% under today's relay and from 6.0% to 3.9% with priority fill. This is independent of upload order and a much simpler change, and it may already be addressed in newer Zebra code; it is worth checking either way. Together, the two changes took the model from 16.2% to 3.9%.
 
 ## 7. Security implications
 
@@ -154,8 +154,8 @@ If the testbed's stale-rate reduction carried over to mainnet, most of the secur
 | 3.6%: priority fill, 25 s blocks, mixed network | 49.1% | 26 (10.8 min) | 1.6% |
 | 5.9%: current relay, datacenter-only network | 48.5% | 27 (11.3 min) | 2.7% |
 | 4.1%: priority fill, datacenter-only network | 49.0% | 26 (10.8 min) | 1.8% |
-| 16.2%: current relay, random 25 s blocks, 1,000-node model (orphans counted) | 45.6% | 36 (15.0 min) | 7.3% |
-| 6.0%: priority fill, random 25 s blocks, 1,000-node model (orphans counted) | 48.5% | 27 (11.3 min) | 2.7% |
+| 16.2%: current relay, Poisson 25 s blocks, 1,000-node model (orphans counted) | 45.6% | 36 (15.0 min) | 7.3% |
+| 6.0%: priority fill, Poisson 25 s blocks, 1,000-node model (orphans counted) | 48.5% | 27 (11.3 min) | 2.7% |
 
 **Majority attacks.** Stale blocks are wasted honest work, while an attacker mining privately wastes none. With a stale fraction *s*, an attacker needs (1 − *s*) / (2 − *s*) of total hashrate rather than half.
 
@@ -163,7 +163,7 @@ If the testbed's stale-rate reduction carried over to mainnet, most of the secur
 
 **Selfish mining.** [Gervais et al.](https://eprint.iacr.org/2016/555) found that higher stale rates raise a selfish miner's relative revenue. In [Eyal and Sirer's model](https://arxiv.org/abs/1311.0243) profitability depends on how often honest miners build on a withheld block in a race, which is a propagation contest; getting honest blocks to miners faster narrows that window.
 
-**Mining centralization.** A pool never orphans its own blocks, so its stale rate scales with the hashrate outside it; its edge over a small pool is roughly the difference in their shares times the network stale rate. With the largest pool [near 46% of hashrate](https://bedrock-site.pages.dev/blog/announcing-bedrock), the edge would be 4.5% at a 10% stale rate against 0.2% today, and 1.6% with priority fill. In the 1,000-node model with random block times, which counts orphans directly, the edge would be 7.3% under today's relay and 2.7% with priority fill. This is likely the most important long-term effect.
+**Mining centralization.** A pool never orphans its own blocks, so its stale rate scales with the hashrate outside it; its edge over a small pool is roughly the difference in their shares times the network stale rate. With the largest pool [near 46% of hashrate](https://bedrock-site.pages.dev/blog/announcing-bedrock), the edge would be 4.5% at a 10% stale rate against 0.2% today, and 1.6% with priority fill. In the 1,000-node model with Poisson block arrivals, which counts orphans directly, the edge would be 7.3% under today's relay and 2.7% with priority fill. This is likely the most important long-term effect.
 
 **Caveat.** Real hashrate is concentrated, which lowers measured stale rates (ZIP 218 notes this for the 0.4% measured at 75 s spacing). The direction of every effect above holds, but the absolute numbers should be read as illustrations.
 
@@ -244,7 +244,7 @@ These results show direction and rough size, not mainnet numbers.
 - **No real validation.** A fixed 50 ms stands in for verification; ZIP 218 reports worst-case shielded verification of 272–432 ms, which would add the same delay per hop in both modes.
 - **Emulated steady state.** Learned rankings were emulated by seeding noisy estimates, not by running nodes for hours.
 - **Scale.** 100 nodes on one machine with 4× time dilation; 6 measured blocks per run. Confidence intervals are shown, but more runs would narrow them.
-- **Estimated, not observed, stale rates.** The first testbed runs mined on a fixed schedule, so forks there were modelled from delays. The 1,000-node model mines at random times and counts orphans directly, but it is a simplified bandwidth model rather than Zebra's code. Testbed runs with random block times exceeded this machine's memory when blocks overlapped, so random block times have not yet been tested on Zebra's own code.
+- **Estimated, not observed, stale rates.** The first testbed runs mined on a fixed schedule, so forks there were modelled from delays. The 1,000-node model mines with Poisson block arrivals and counts orphans directly, but it is a simplified bandwidth model rather than Zebra's code. Testbed runs with Poisson block arrivals exceeded this machine's memory when blocks overlapped, so Poisson block arrivals have not yet been tested on Zebra's own code.
 - **One attack.** Only the slow-reading attack was tested.
 - **Full blocks only.** Every block was 1.95 MB; compact blocks were not modelled.
 
@@ -262,7 +262,7 @@ This proposal is a starting point. These are the questions we think would need a
 
 ## 12. Conclusion
 
-Changing only the order in which a node uploads blocks, with no new messages and no consensus change, cut the estimated stale rate for 2 MB blocks at 25-second spacing from 10.0% to 3.6% in a 100-node testbed built on Zebra's networking code. If anything like that held on mainnet, it would recover most of the security cost of 25-second blocks, especially the extra advantage they give large pools. With blocks found at random times, a 1,000-node model counted 16.2% of blocks orphaned under today's relay against 6.0% with priority fill.
+Changing only the order in which a node uploads blocks, with no new messages and no consensus change, cut the estimated stale rate for 2 MB blocks at 25-second spacing from 10.0% to 3.6% in a 100-node testbed built on Zebra's networking code. If anything like that held on mainnet, it would recover most of the security cost of 25-second blocks, especially the extra advantage they give large pools. With Poisson block arrivals, a 1,000-node model counted 16.2% of blocks orphaned under today's relay against 6.0% with priority fill.
 
 The evidence is early and the costs are real: the gain depends on learned rankings, the slowest nodes do not benefit, and a ranking is something attackers can target; demotion limits, but does not remove, the one attack we tested. We are not proposing an implementation. We are proposing that upload order deserves a place in the discussion of Zcash block relay, alongside compact blocks, and we invite the Zebra team and the community to challenge the assumptions and help answer the questions in section 11.
 

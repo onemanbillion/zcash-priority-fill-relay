@@ -22,6 +22,8 @@ export const SCENARIOS = {
   withhold:   { frac: 0.10, up: 500, down: 500, beh: { noServe: true } },          // announce, then refuse to serve
   capture:    { frac: 0.10, up: 500, down: 500, beh: { noRelay: true }, extraConn: 40 }, // widely connected dead end
   slowcapture:{ frac: 0.10, up: 500, down: 1,   beh: {}, extraConn: 40 },          // slow reader, widely connected
+  dodge:      { frac: 0.10, up: 500, down: 6,   beh: {} },                         // read just fast enough to dodge the stall watchdog
+  defect:     { frac: 0.10, up: 500, down: 500, beh: { noRelay: true, noServe: true, defectAfterS: 500 } }, // relay to earn trust, then withhold
 };
 
 function shuffle(r, a) { for (let k = a.length - 1; k > 0; k--) { const m = Math.floor(r() * (k + 1)); [a[k], a[m]] = [a[m], a[k]]; } return a; }

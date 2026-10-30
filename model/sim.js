@@ -290,7 +290,8 @@ export class Sim {
     } else if (kind === GETDATA) { // requester a asks sender b for block x
       // A non-serving node (behaviour.noServe) accepts the request but never sends the
       // block, so requester a waits out its timeout and then refetches elsewhere.
-      if (nodes[b].beh && nodes[b].beh.noServe) {
+      const bb = nodes[b].beh;
+      if (bb && bb.noServe && (!bb.defectAfterS || te >= bb.defectAfterS)) {
         this.heap.push([te + p.requestTimeoutS, TIMEOUT, a, b, { blk: x, to: a, from: b, noServe: true, done: false }]);
         return;
       }
@@ -309,7 +310,8 @@ export class Sim {
       // A non-relaying node (behaviour.noRelay) validates blocks but never announces them
       // onward, so the upload capacity it was served (ranked first under priority fill) is
       // spent on a dead end.
-      if (nodes[a].beh && nodes[a].beh.noRelay) { this.lastAnnounced[a] = this.tip[a]; return; }
+      const ab = nodes[a].beh;
+      if (ab && ab.noRelay && (!ab.defectAfterS || te >= ab.defectAfterS)) { this.lastAnnounced[a] = this.tip[a]; return; }
       const tip = this.tip[a];
       if (tip >= 0 && tip !== this.lastAnnounced[a]) {
         const peers = nodes[a].peers.slice();
@@ -351,7 +353,11 @@ export class Sim {
         // finished gives up its slot and demotes the peer
         let live = 0;
         for (const q of s.active) {
-          if (!q.released && p.demote && t - q.t0 >= Math.max(p.fillIdleS, q.size / (p.demoteRatio * Math.min(q.est, U)))) {
+          // Time the stall watchdog off the link-implied estimate, not the peer's possibly
+          // already-demoted rank cap: otherwise a peer demoted once is given ever longer to
+          // stall on later blocks. Keeps demotion firing promptly every block.
+          const watchEst = Math.min(this.baseEst(i, q.to), U);
+          if (!q.released && p.demote && t - q.t0 >= Math.max(p.fillIdleS, q.size / (p.demoteRatio * watchEst))) {
             q.released = true;
             this.caps.set(i * nodes.length + q.to, q.size / (t - q.t0));
             this.demotions++;
@@ -391,6 +397,16 @@ export class Sim {
       for (let m = s.active.length - 1; m >= 0; m--) {
         const q = s.active[m];
         q.left -= q.rate * p.dt;
+        // A transfer still unfinished at the request timeout is dropped, as Zebra drops a
+        // request that misses REQUEST_TIMEOUT: the slot is freed so it cannot be held forever
+        // by a peer that reads at (near) zero. The requester's own TIMEOUT event refetches.
+        if (q.left > 0 && t - q.t0 >= p.requestTimeoutS) {
+          s.active.splice(m, 1);
+          this.downActive[q.to]--;
+          if (!q.abandoned) this.recent.push({ from: i, to: q.to, blk: q.blk, t1: t, aborted: true });
+          q.abandoned = true;
+          continue;
+        }
         if (q.left <= 0) {
           s.active.splice(m, 1);
           q.done = true;

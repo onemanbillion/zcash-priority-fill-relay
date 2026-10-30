@@ -49,6 +49,14 @@ export const PARAMS = {
   estNoise: 0.5, // ±50% error on each node's view of each peer
   demote: true, // cap a peer's rank at the rate it actually read a block response at
   demoteRatio: 0.25,
+  // candidate defences against ranking games (all off by default = priority fill as in the paper)
+  repeatLast: false,   // a repeat request for a block already sent to that peer is served last
+  perPeerCap: 0,       // max concurrent transfers from one sender to one peer (0 = no cap)
+  randomEvery: 0,      // every k-th admission picks a random waiting request (optimistic unchoke; 0 = off)
+  outboundBias: 1,     // rank multiplier for inbound peers (<1 demotes peers that dialled us; 1 = off)
+  reciprocity: 0,      // rank weight for peers that have delivered new blocks to us (0 = off)
+  reciprocityFloor: 1, // rank multiplier for a peer with no delivery credit (used when reciprocity>0)
+  reciprocityHalfLifeS: 120, // decay half-life of delivery credit
   minerCount: 40,
   intervalS: 25,
   attackers: 0, // slow-reading attackers: 500 Mb/s up (ranked first), 1 Mb/s down
@@ -78,6 +86,7 @@ export function makeNetwork(seed = 7, p = PARAMS) {
       i, cls: cls.id, region: reg.name,
       x: reg.x + gauss(r) * reg.r * 0.45, y: reg.y + gauss(r) * reg.r * 0.45,
       up: cls.up * j(), down: cls.down * j(), accept: cls.accept, peers: [], inbound: 0,
+      outPeers: new Set(),
     });
   }
   const accepting = nodes.filter(n => n.accept > 0);
@@ -97,6 +106,7 @@ export function makeNetwork(seed = 7, p = PARAMS) {
       const lat = Math.min(0.16, Math.max(0.008, 0.006 + d * 0.075 + r() * 0.01));
       n.peers.push({ j: t.i, lat });
       t.peers.push({ j: n.i, lat });
+      n.outPeers.add(t.i); // n dialled t: from t's view, n is an inbound peer
     }
   }
   if (p.attackers) {
@@ -172,6 +182,36 @@ export class Sim {
     this.caps = new Map(); // sender*N+peer -> demoted rate cap (Mb/s)
     this.recent = []; // completed or aborted transfers, for drawing
     this.demotions = 0;
+    this.credit = new Map();   // sender*N+peer -> {v, t}: decaying count of new blocks peer delivered to sender
+    this.delivered = new Map(); // sender*N+peer -> Set of block ids already sent, for repeatLast
+    this.admits = 0;
+  }
+
+  // Reciprocity credit: how often `peer` was the first to deliver a block to `sender`,
+  // decayed over time. A node that never relays (black hole) never earns credit.
+  creditOf(sender, peer, t) {
+    const c = this.credit.get(sender * this.net.nodes.length + peer);
+    if (!c) return 0;
+    return c.v * Math.pow(0.5, (t - c.t) / this.p.reciprocityHalfLifeS);
+  }
+
+  addCredit(sender, peer, t) {
+    const key = sender * this.net.nodes.length + peer;
+    this.credit.set(key, { v: this.creditOf(sender, peer, t) + 1, t });
+  }
+
+  // Rank a waiting request, higher served first. Base is measured throughput (est), as in
+  // the paper; defences fold in reciprocity, outbound preference and a repeat-last penalty.
+  rankScore(sender, req, t) {
+    const p = this.p;
+    let s = req.est;
+    if (p.reciprocity) s *= p.reciprocityFloor + p.reciprocity * this.creditOf(sender, req.to, t);
+    if (p.outboundBias !== 1 && !this.net.nodes[sender].outPeers.has(req.to)) s *= p.outboundBias;
+    if (p.repeatLast) {
+      const d = this.delivered.get(sender * this.net.nodes.length + req.to);
+      if (d && d.has(req.blk)) s = -1; // already sent this block to this peer: serve last
+    }
+    return s;
   }
 
   heightOf(id) { return id < 0 ? 0 : this.blocks[id].height; }
@@ -214,6 +254,8 @@ export class Sim {
     const blk = this.blocks[b];
     if (blk.recv[i] !== Infinity) return;
     blk.recv[i] = t;
+    // reciprocity: `from` was the first to deliver this block to i
+    if (this.p.reciprocity && from >= 0) this.addCredit(i, from, t);
     const par = blk.parent;
     if (par < 0 || this.blocks[par].val[i] <= t) {
       this.heap.push([t + this.p.validateS, VALID, i, 0, b]);
@@ -246,6 +288,12 @@ export class Sim {
       const blk = this.blocks[x];
       if (blk.recv[b] === Infinity && !blk.fetching[b]) { blk.fetching[b] = 1; this.heap.push([te + nodes[b].lat.get(a), GETDATA, b, a, x]); }
     } else if (kind === GETDATA) { // requester a asks sender b for block x
+      // A non-serving node (behaviour.noServe) accepts the request but never sends the
+      // block, so requester a waits out its timeout and then refetches elsewhere.
+      if (nodes[b].beh && nodes[b].beh.noServe) {
+        this.heap.push([te + p.requestTimeoutS, TIMEOUT, a, b, { blk: x, to: a, from: b, noServe: true, done: false }]);
+        return;
+      }
       const req = { blk: x, to: a, from: b, tReq: te, size: p.blockMbit, left: p.blockMbit, rate: 0, t0: -1,
         est: this.est(b, a), done: false };
       const s = this.S[b];
@@ -258,6 +306,10 @@ export class Sim {
       this.validated(a, x, te);
     } else if (kind === GOSSIP) {
       this.gossipPending[a] = 0;
+      // A non-relaying node (behaviour.noRelay) validates blocks but never announces them
+      // onward, so the upload capacity it was served (ranked first under priority fill) is
+      // spent on a dead end.
+      if (nodes[a].beh && nodes[a].beh.noRelay) { this.lastAnnounced[a] = this.tip[a]; return; }
       const tip = this.tip[a];
       if (tip >= 0 && tip !== this.lastAnnounced[a]) {
         const peers = nodes[a].peers.slice();
@@ -310,12 +362,22 @@ export class Sim {
         if (used < p.fillThreshold * U) { if (s.belowSince < 0) s.belowSince = t; } else s.belowSince = -1;
         const canAdmit = s.waiting.length && (live === 0 ||
           (s.belowSince >= 0 && t - s.belowSince >= p.fillIdleS && t - s.lastAdmit >= p.admitGapS));
+        // a request is eligible unless the per-peer concurrency cap is already reached for its peer
+        const activeTo = r => { let c = 0; for (const a2 of s.active) if (a2.to === r.to && !a2.released) c++; return c; };
+        const eligible = m => !p.perPeerCap || activeTo(s.waiting[m]) < p.perPeerCap;
         let k = -1;
-        for (let m = 0; m < s.waiting.length; m++) if (t - s.waiting[m].tReq > p.overdueS) { k = m; break; }
+        // aging: an overdue request jumps ahead of rank
+        for (let m = 0; m < s.waiting.length; m++) if (eligible(m) && t - s.waiting[m].tReq > p.overdueS) { k = m; break; }
         if (canAdmit || k >= 0) {
-          if (k < 0) { k = 0; for (let m = 1; m < s.waiting.length; m++) if (s.waiting[m].est > s.waiting[k].est) k = m; }
-          const q = s.waiting.splice(k, 1)[0];
-          this.start(q, t); s.lastAdmit = t; s.belowSince = -1;
+          if (k < 0 && p.randomEvery && this.admits % p.randomEvery === p.randomEvery - 1) {
+            // optimistic unchoke: give one slot to a random eligible peer, so a steadily
+            // low-ranked honest node is not starved and attackers cannot own every slot
+            const idxs = []; for (let m = 0; m < s.waiting.length; m++) if (eligible(m)) idxs.push(m);
+            if (idxs.length) k = idxs[Math.floor(this.r() * idxs.length)];
+          }
+          if (k < 0) for (let m = 0; m < s.waiting.length; m++)
+            if (eligible(m) && (k < 0 || this.rankScore(i, s.waiting[m], t) > this.rankScore(i, s.waiting[k], t))) k = m;
+          if (k >= 0) { const q = s.waiting.splice(k, 1)[0]; this.start(q, t); s.lastAdmit = t; s.belowSince = -1; this.admits++; }
         }
         let rem = U;
         for (const q of s.active) if (!q.released) { q.rate = Math.min(cap(q), rem); rem -= q.rate; }
@@ -337,6 +399,11 @@ export class Sim {
           if (!q.abandoned) {
             this.recent.push({ from: i, to: q.to, blk: q.blk, t1: t + L });
             this.heap.push([t + L, ARRIVE, q.to, i, q.blk]);
+            if (p.repeatLast) {
+              const key = i * nodes.length + q.to;
+              let d = this.delivered.get(key); if (!d) this.delivered.set(key, d = new Set());
+              d.add(q.blk);
+            }
           }
           if (this.mode === 'priority' && p.demote) {
             const rate = q.size / Math.max(1e-6, t - q.t0);

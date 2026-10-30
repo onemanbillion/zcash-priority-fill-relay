@@ -24,6 +24,35 @@ export const SCENARIOS = {
   slowcapture:{ frac: 0.10, up: 500, down: 1,   beh: {}, extraConn: 40 },          // slow reader, widely connected
   dodge:      { frac: 0.10, up: 500, down: 6,   beh: {} },                         // read just fast enough to dodge the stall watchdog
   defect:     { frac: 0.10, up: 500, down: 500, beh: { noRelay: true, noServe: true, defectAfterS: 500 } }, // relay to earn trust, then withhold
+
+  // ---- NEW red-team scenarios (added for hardening evaluation) ----
+  // Higher attacker fractions of the slow-reader (rank-first, hold-slot) attack
+  flood20:     { frac: 0.20, up: 500, down: 1,   beh: {} },
+  flood33:     { frac: 0.33, up: 500, down: 1,   beh: {} },
+  // Higher fractions of the watchdog-dodging reader
+  dodge20:     { frac: 0.20, up: 500, down: 6,   beh: {} },
+  dodge33:     { frac: 0.33, up: 500, down: 6,   beh: {} },
+  // Higher fractions of the blackhole (fast fetch, never relay)
+  blackhole20: { frac: 0.20, up: 500, down: 500, beh: { noRelay: true } },
+  blackhole33: { frac: 0.33, up: 500, down: 500, beh: { noRelay: true } },
+  // Higher fraction of announce-then-refuse
+  withhold20:  { frac: 0.20, up: 500, down: 500, beh: { noServe: true } },
+  // Sybil reach: a few fast dead-ends each opening a huge inbound fan-out to honest nodes
+  sybil:       { frac: 0.10, up: 500, down: 500, beh: { noRelay: true }, extraConn: 100 },
+  sybilbig:    { frac: 0.15, up: 500, down: 500, beh: { noRelay: true }, extraConn: 120 },
+  // Slow-reader capture at higher fraction/reach: hold slots AND be widely connected
+  slowcapture20:{ frac: 0.20, up: 500, down: 1,  beh: {}, extraConn: 60 },
+  dodgecapture: { frac: 0.20, up: 500, down: 6,  beh: {}, extraConn: 40 },
+  // Earn reciprocity credit by relaying, then defect sooner (before credit fully decays elsewhere)
+  defectfast:  { frac: 0.20, up: 500, down: 500, beh: { noRelay: true, noServe: true, defectAfterS: 120 } },
+  // Miner-targeting: well-connected fast dead-ends that attach directly to miners and
+  // contend for miner upload slots (ranked first, then never relay onward)
+  minercapture: { frac: 0.10, up: 500, down: 500, beh: { noRelay: true }, extraConn: 40, target: 'miner' },
+  minerslow:    { frac: 0.10, up: 500, down: 1,   beh: {}, extraConn: 40, target: 'miner' },
+  minerslow20:  { frac: 0.20, up: 500, down: 1,   beh: {}, extraConn: 40, target: 'miner' },
+  // High-degree targeting: attach to the best-connected honest relays and sink their upload
+  hubcapture:   { frac: 0.10, up: 500, down: 500, beh: { noRelay: true }, extraConn: 60, target: 'highdeg' },
+  hubslow:      { frac: 0.15, up: 500, down: 1,   beh: {}, extraConn: 60, target: 'highdeg' },
 };
 
 function shuffle(r, a) { for (let k = a.length - 1; k > 0; k--) { const m = Math.floor(r() * (k + 1)); [a[k], a[m]] = [a[m], a[k]]; } return a; }
@@ -36,7 +65,20 @@ function applyScenario(net, sc, seed) {
     Object.assign(nodes[i], { cls: 'bad', up: sc.up, down: sc.down, beh: { ...sc.beh } });
     if (sc.extraConn) {
       const have = new Set(nodes[i].peers.map(q => q.j));
-      const honest = shuffle(r, nodes.filter(n => !bad.has(n.i) && n.i !== i).map(n => n.i));
+      // target selects which honest nodes the attacker dials: random (default),
+      // 'miner' (attach directly to miners / miner-adjacent), or 'highdeg' (best-connected relays)
+      let candidates;
+      if (sc.target === 'miner') {
+        const ms = net.miners.filter(m => !bad.has(m) && m !== i);
+        const rest = shuffle(r, nodes.filter(n => !bad.has(n.i) && n.i !== i && !net.miners.includes(n.i)).map(n => n.i));
+        candidates = [...shuffle(r, ms.slice()), ...rest]; // miners first, then fill with others
+      } else if (sc.target === 'highdeg') {
+        candidates = nodes.filter(n => !bad.has(n.i) && n.i !== i)
+          .sort((a, b) => b.peers.length - a.peers.length).map(n => n.i);
+      } else {
+        candidates = shuffle(r, nodes.filter(n => !bad.has(n.i) && n.i !== i).map(n => n.i));
+      }
+      const honest = candidates;
       for (const h of honest.slice(0, sc.extraConn)) {
         if (have.has(h)) continue;
         const lat = 0.02 + r() * 0.1;

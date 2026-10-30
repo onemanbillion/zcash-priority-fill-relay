@@ -57,6 +57,7 @@ export const PARAMS = {
   reciprocity: 0,      // rank weight for peers that have delivered new blocks to us (0 = off)
   reciprocityFloor: 1, // rank multiplier for a peer with no delivery credit (used when reciprocity>0)
   reciprocityHalfLifeS: 120, // decay half-life of delivery credit
+  demoteCooldownS: 0,  // after demoting a stalled peer, don't re-admit it for this long (0 = off)
   minerCount: 40,
   intervalS: 25,
   attackers: 0, // slow-reading attackers: 500 Mb/s up (ranked first), 1 Mb/s down
@@ -182,6 +183,7 @@ export class Sim {
     this.caps = new Map(); // sender*N+peer -> demoted rate cap (Mb/s)
     this.recent = []; // completed or aborted transfers, for drawing
     this.demotions = 0;
+    this.cooldown = new Map(); // sender*N+peer -> time until which a recently-demoted peer is not re-admitted
     this.credit = new Map();   // sender*N+peer -> {v, t}: decaying count of new blocks peer delivered to sender
     this.delivered = new Map(); // sender*N+peer -> Set of block ids already sent, for repeatLast
     this.admits = 0;
@@ -360,6 +362,7 @@ export class Sim {
           if (!q.released && p.demote && t - q.t0 >= Math.max(p.fillIdleS, q.size / (p.demoteRatio * watchEst))) {
             q.released = true;
             this.caps.set(i * nodes.length + q.to, q.size / (t - q.t0));
+            if (p.demoteCooldownS) this.cooldown.set(i * nodes.length + q.to, t + p.demoteCooldownS);
             this.demotions++;
           }
           if (!q.released) live++;
@@ -368,12 +371,15 @@ export class Sim {
         if (used < p.fillThreshold * U) { if (s.belowSince < 0) s.belowSince = t; } else s.belowSince = -1;
         const canAdmit = s.waiting.length && (live === 0 ||
           (s.belowSince >= 0 && t - s.belowSince >= p.fillIdleS && t - s.lastAdmit >= p.admitGapS));
-        // a request is eligible unless the per-peer concurrency cap is already reached for its peer
+        // a request is eligible unless the per-peer concurrency cap is reached, or the peer is
+        // in a post-demotion cooldown (it stalled recently, so don't hand it the slot again yet)
         const activeTo = r => { let c = 0; for (const a2 of s.active) if (a2.to === r.to && !a2.released) c++; return c; };
-        const eligible = m => !p.perPeerCap || activeTo(s.waiting[m]) < p.perPeerCap;
+        const capOk = m => !p.perPeerCap || activeTo(s.waiting[m]) < p.perPeerCap;
+        const cooled = m => p.demoteCooldownS && (this.cooldown.get(i * nodes.length + s.waiting[m].to) || 0) > t;
+        const eligible = m => capOk(m) && !cooled(m);
         let k = -1;
-        // aging: an overdue request jumps ahead of rank
-        for (let m = 0; m < s.waiting.length; m++) if (eligible(m) && t - s.waiting[m].tReq > p.overdueS) { k = m; break; }
+        // aging: an overdue request jumps ahead of rank and bypasses the cooldown so nothing starves
+        for (let m = 0; m < s.waiting.length; m++) if (capOk(m) && t - s.waiting[m].tReq > p.overdueS) { k = m; break; }
         if (canAdmit || k >= 0) {
           if (k < 0 && p.randomEvery && this.admits % p.randomEvery === p.randomEvery - 1) {
             // optimistic unchoke: give one slot to a random eligible peer, so a steadily
@@ -424,7 +430,10 @@ export class Sim {
           if (this.mode === 'priority' && p.demote) {
             const rate = q.size / Math.max(1e-6, t - q.t0);
             const key = i * nodes.length + q.to;
-            if (rate < p.demoteRatio * Math.min(q.est, U)) { this.caps.set(key, rate); this.demotions++; } else this.caps.delete(key);
+            if (rate < p.demoteRatio * Math.min(q.est, U)) {
+              this.caps.set(key, rate); this.demotions++;
+              if (p.demoteCooldownS) this.cooldown.set(key, t + p.demoteCooldownS);
+            } else { this.caps.delete(key); this.cooldown.delete(key); }
           }
         }
       }

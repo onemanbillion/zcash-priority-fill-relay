@@ -22,6 +22,17 @@ export const CLASSES = [
   { id: 'rural', name: 'Rural / poor', share: 0.10, up: 3, down: 25, accept: 0.05 },
 ];
 
+// Upload-capacity classes fitted to the 24h mainnet measurement of reachable nodes
+// (long-stream probes): ~82% are not uplink-limited and deliver 100+ Mb/s; ~18% are
+// uplink-limited, median ~78 Mb/s. Reachable nodes skew faster/hosted than the whole
+// network, since NAT'd home nodes can't be probed — so this is an optimistic set.
+export const MEASURED_CLASSES = [
+  { id: 'dc',      name: 'Hosted / fast',   share: 0.55, up: 400, down: 500, accept: 1.0 },
+  { id: 'fiber',   name: 'Fast home',       share: 0.27, up: 200, down: 500, accept: 0.6 },
+  { id: 'limited', name: 'Uplink-limited',  share: 0.15, up: 78,  down: 150, accept: 0.3 },
+  { id: 'slow',    name: 'Slow',            share: 0.03, up: 15,  down: 50,  accept: 0.1 },
+];
+
 // Rough distribution of public nodes by region; positions on a unit plane.
 export const REGIONS = [
   { name: 'North America', w: 0.32, x: -0.72, y: 0.5, r: 0.2 },
@@ -58,8 +69,14 @@ export const PARAMS = {
   reciprocityFloor: 1, // rank multiplier for a peer with no delivery credit (used when reciprocity>0)
   reciprocityHalfLifeS: 120, // decay half-life of delivery credit
   demoteCooldownS: 0,  // after demoting a stalled peer, don't re-admit it for this long (0 = off)
+  // mainnet-calibrated per-connection TCP model (off = original size/bandwidth model)
+  rttModel: false,
+  initWinKB: 16,       // initial congestion window (~10 packets)
+  maxWinKB: 3400,      // steady window; fits measured tail throughput vs RTT
   minerCount: 40,
   intervalS: 25,
+  measured: false,     // use the mainnet-measured capacity classes and Zebra/Zakura fanout mix
+  zakuraShare: 0.43,   // 24h census: 81 Zakura / 190 reachable nodes
   attackers: 0, // slow-reading attackers: 500 Mb/s up (ranked first), 1 Mb/s down
 };
 
@@ -79,8 +96,9 @@ function pick(r, items, key) {
 export function makeNetwork(seed = 7, p = PARAMS) {
   const r = rng(seed);
   const nodes = [];
+  const classes = p.measured ? MEASURED_CLASSES : CLASSES;
   for (let i = 0; i < p.n; i++) {
-    const cls = pick(r, CLASSES, 'share');
+    const cls = pick(r, classes, 'share');
     const reg = pick(r, REGIONS, 'w');
     const j = () => 0.65 + 0.7 * r();
     nodes.push({
@@ -88,6 +106,8 @@ export function makeNetwork(seed = 7, p = PARAMS) {
       x: reg.x + gauss(r) * reg.r * 0.45, y: reg.y + gauss(r) * reg.r * 0.45,
       up: cls.up * j(), down: cls.down * j(), accept: cls.accept, peers: [], inbound: 0,
       outPeers: new Set(),
+      // measured software mix: Zakura announces relayed blocks to all peers, Zebra to a third
+      fanout: p.measured ? (r() < p.zakuraShare ? 1.0 : 1 / 3) : p.fanout,
     });
   }
   const accepting = nodes.filter(n => n.accept > 0);
@@ -318,7 +338,8 @@ export class Sim {
       if (tip >= 0 && tip !== this.lastAnnounced[a]) {
         const peers = nodes[a].peers.slice();
         for (let k = peers.length - 1; k > 0; k--) { const m = Math.floor(this.r() * (k + 1)); [peers[k], peers[m]] = [peers[m], peers[k]]; }
-        for (const q of peers.slice(0, Math.ceil(peers.length * p.fanout))) this.heap.push([te + q.lat, INV, a, q.j, tip]);
+        const fo = nodes[a].fanout ?? p.fanout;
+        for (const q of peers.slice(0, Math.ceil(peers.length * fo))) this.heap.push([te + q.lat, INV, a, q.j, tip]);
         this.lastGossip[a] = te; this.lastAnnounced[a] = tip;
       }
     } else if (kind === TIMEOUT) {
@@ -349,7 +370,16 @@ export class Sim {
     const p = this.p, nodes = this.net.nodes, t = this.t;
     for (const i of this.busy) {
       const s = this.S[i], U = nodes[i].up;
-      const cap = q => nodes[q.to].down / Math.max(1, this.downActive[q.to]);
+      // Per-connection ceiling from the mainnet measurement: one TCP connection is limited by
+      // its congestion window over the round trip, after a slow-start ramp. Calibrated so a
+      // 2 MB block takes ~7 RTTs (matches measured full-block delivery p50 0.63s / p90 2.0s).
+      const connCeil = q => {
+        if (!p.rttModel || q.t0 < 0) return Infinity;
+        const rtt = 2 * (nodes[i].lat.get(q.to) || 0.05);
+        const cwndMbit = Math.min(p.maxWinKB, p.initWinKB * Math.pow(2, (t - q.t0) / rtt)) * 8 / 1000;
+        return cwndMbit / rtt; // Mb/s
+      };
+      const cap = q => Math.min(nodes[q.to].down / Math.max(1, this.downActive[q.to]), connCeil(q));
       if (this.mode === 'priority') {
         // stall watchdog: a response still running when even a slow honest reader would have
         // finished gives up its slot and demotes the peer

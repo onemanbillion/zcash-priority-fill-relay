@@ -23,6 +23,8 @@ NU7 activated on 5 November, taking the target block interval to 25 s. The propo
 | Zakura announce delay (p50 / p90) | 9.0 s / 49 s | 0.16 s / 3.1 s |
 | Reachable nodes | ~190 | ~400 |
 
+> **📊 Insert chart: `c1_nu7_before_after.png`**
+
 Two things drove this. First, blocks stayed tiny — median block is **~1.7 kB**, 90th percentile ~30 kB. Second, and more striking: the dominant propagation tail before NU7 was Zakura's announcement queue (p90 of 49 s), and that is essentially gone now (p90 3.1 s). That lines up with a Zakura relay change around the NU7 window; if a Zakura dev can confirm what shipped, I'd like to cite it correctly. Zebra's behaviour is unchanged and fast throughout (announce p50 ~0.2 s), with the expected ~2.5 s bump on blocks that land within 7 s of the previous one (its gossip-interval rate limit).
 
 So: **the 25 s upgrade went smoothly, and the everyday network is healthier than before it.** That is good news and worth stating plainly.
@@ -32,6 +34,8 @@ So: **the 25 s upgrade went smoothly, and the everyday network is healthier than
 The proposal's claim was never "25 s blocks cause orphans today." It was that the risk shows up with **larger blocks**, and that Zcash blocks are almost always near-empty so it isn't biting yet. The measurement confirms both halves: empty blocks propagate beautifully, and — as shown next — full blocks don't.
 
 ## Large blocks: the contention is real, and it lands early
+
+> **📊 Insert chart: `c2_by_blocksize.png`**
 
 Over the measurement period there have been **284 full (≈2 MB) blocks** — not organic traffic; someone filling blocks in bursts — giving **5,374 same-node busy-vs-idle pairs**. On these:
 
@@ -46,11 +50,15 @@ The question I most wanted answered: **where in a block's propagation does this 
 | Mid (25–75%) | 9.7% | 0.71 |
 | Late (>75%) | 14% | 0.59 |
 
+> **📊 Insert chart: `c3_phase.png`**
+
 **82% of all severely-contended relays fell in the early phase** — the critical path. So the congestion is not an irrelevant tail effect; it concentrates exactly where it raises orphan risk. This is the strongest evidence I have that the mechanism priority fill targets is real on mainnet, under the conditions (large blocks) the proposal is scoped to.
 
 ## Why it happens: TCP, not raw bandwidth
 
 The long-form measurements (≈37k download probes) show a single connection is limited by its congestion window over the round trip, not by the node's link: after slow-start, one connection delivers ~350 Mb/s at 20 ms RTT, ~120 Mb/s at 100 ms, ~75 Mb/s at 200 ms, and a 2 MB block takes ~7 round trips to arrive. Only **~15% of reachable nodes are genuinely uplink-limited** (median capacity ~39 Mb/s); the rest are fast. So contention arises when a slower-uplink node has to push a large block to several peers at once — its parallel uploads add up past its link, and today every peer's copy slows down together.
+
+> **📊 Insert chart: `c5_tcp_rtt.png`**
 
 ## Recalibrated model: priority fill helps for large blocks, not small
 
@@ -62,6 +70,8 @@ Feeding the measured capacities, RTT/window behaviour and Zebra/Zakura mix back 
 | 2 MB (full) | 75 s | 3.8% | 3.4% | −0.4% |
 | 2 MB (full) | 25 s | 11.0% | 9.8% | **−1.2%** |
 | 2 MB, slower network | 25 s | 12.3% | 9.7% | **−2.6%** |
+
+> **📊 Insert chart: `c4_model.png`**
 
 Read honestly: for today's tiny blocks priority fill is **marginally negative** (its admission staging adds a little per-hop latency with no contention to fix); its benefit is confined to large-block periods, and grows at 25 s spacing and on slower networks. This suggests a concrete design rule — **priority fill should engage only above a block-size threshold**, serving small blocks immediately as today and prioritising the uplink only when there's actually contention to manage.
 
